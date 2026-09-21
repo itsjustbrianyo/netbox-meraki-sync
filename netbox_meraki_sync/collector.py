@@ -337,13 +337,13 @@ class MerakiCollector:
 
     def _get_switch_ports(self, serial: str) -> list[dict]:
         try:
-            return self.dashboard.devices.getDeviceSwitchPorts(serial=serial)
+            return self.dashboard.switch.getDeviceSwitchPorts(serial=serial)
         except meraki.exceptions.APIError:
             return []
 
     def _get_switch_port_statuses(self, serial: str) -> list[dict]:
         try:
-            return self.dashboard.devices.getDeviceSwitchPortsStatuses(serial=serial)
+            return self.dashboard.switch.getDeviceSwitchPortsStatuses(serial=serial)
         except meraki.exceptions.APIError:
             return []
 
