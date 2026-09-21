@@ -14,7 +14,7 @@ dcim.Device               — one per Meraki serial; matched by serial first
 dcim.Interface            — one per port; type derived from model family
 dcim.MACAddress           — one per unique MAC; linked to interface
 ipam.IPAddress            — optional; created when sync_ip_addresses=True
-extras.Tag                — "meraki" tag applied to every synced device
+extras.Tag                — "meraki" tag applied to every synced device + tags inherited from parent Site
 
 Custom fields on dcim.site
 ---------------------------
@@ -152,6 +152,8 @@ class MerakiSyncer:
             ).first()
         )
 
+        tenant = site.tenant if site else None
+
         if device is None:
             if not self.dry_run:
                 device = Device.objects.create(
@@ -160,6 +162,7 @@ class MerakiSyncer:
                     device_type = device_type,
                     role        = role,
                     site        = site,
+                    tenant      = tenant,  # Inherits Tenant from parent Site
                     status      = "active",
                 )
             self.log.devices_created += 1
@@ -175,6 +178,9 @@ class MerakiSyncer:
             if device.site_id != site.pk:
                 device.site = site
                 changed.append("site")
+            if device.tenant_id != (tenant.pk if tenant else None):
+                device.tenant = tenant
+                changed.append("tenant")
             if device.status != "active":
                 device.status = "active"
                 changed.append("status")
@@ -183,8 +189,15 @@ class MerakiSyncer:
             self.log.devices_updated += 1
             log.debug("Syncer: updated device %s (%s)", dev.name, dev.serial)
 
-        if device and tag and not self.dry_run:
-            device.tags.add(tag)
+        # Apply default "meraki" tag as well as all tags assigned to the parent Site
+        if device and not self.dry_run:
+            tags_to_add = []
+            if tag:
+                tags_to_add.append(tag)
+            if site and site.tags.exists():
+                tags_to_add.extend(list(site.tags.all()))
+            if tags_to_add:
+                device.tags.add(*tags_to_add)
 
         if device is None:
             # dry_run — nothing more to do
