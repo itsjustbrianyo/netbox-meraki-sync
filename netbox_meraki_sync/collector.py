@@ -63,6 +63,52 @@ class CollectedNeighbour:
 
 
 @dataclass
+class CollectedVlan:
+    vlan_id:       int             # 0 = "single LAN" (VLANs not enabled on this network)
+    name:          str
+    subnet:        str = ""        # CIDR, e.g. "192.168.1.0/24"
+    appliance_ip:  str = ""        # MX interface IP for this VLAN/LAN
+    dns_nameservers: str = ""
+    dhcp_handling: str = ""        # Meraki's dhcpHandling: "Run a DHCP server", "Relay DHCP to another server", "Do not respond to DHCP requests"
+    reserved_ip_ranges: list = field(default_factory=list)  # [{"start": "...", "end": "...", "comment": "..."}]
+
+
+@dataclass
+class CollectedStaticRoute:
+    name:        str
+    subnet:      str = ""          # CIDR
+    next_hop_ip: str = ""          # gatewayIp
+    enabled:     bool = True
+    vlan_id:     int = 0            # Layer 3 VLAN ID (from matching MX VLAN or switch L3 interface)
+    vlan_name:   str = ""           # Name of that VLAN/interface, if found
+
+
+@dataclass
+class CollectedSsid:
+    number:      int
+    name:        str
+    enabled:     bool = True
+    auth_mode:   str = ""          # Meraki authMode: open, psk, 8021x-radius, ...
+    vlan_id:     Optional[int] = None
+    psk:         Optional[str] = None  # Pre-shared key — only collected for SSIDs named "IoT" (see collect_network_wireless)
+
+
+@dataclass
+class CollectedStackMembership:
+    """Meraki switch stack membership for a single device."""
+    stack_id:       str    # Meraki stack ID
+    stack_name:     str    # Human-readable stack name
+    master_serial:  str    # Serial of the stack master device
+    member_role:    str    # "master" or "member"
+
+
+@dataclass
+class CollectedNetworkIpam:
+    vlans:         list[CollectedVlan]        = field(default_factory=list)
+    static_routes: list[CollectedStaticRoute] = field(default_factory=list)
+
+
+@dataclass
 class CollectedDevice:
     serial:      str
     name:        str
@@ -75,6 +121,7 @@ class CollectedDevice:
     ports:       list[CollectedPort]    = field(default_factory=list)
     macs:        list[CollectedMac]     = field(default_factory=list)
     neighbours:  list[CollectedNeighbour] = field(default_factory=list)
+    stack_membership: Optional[CollectedStackMembership] = None  # Set if device is part of a Meraki switch stack
 
     @property
     def family(self) -> str:
@@ -122,20 +169,18 @@ class MerakiCollector:
     # High-level entry point
     # ------------------------------------------------------------------
 
-    def collect_network(
-        self,
-        network_id: str,
-        *,
-        client_timespan: int = 86400,
-    ) -> list[CollectedDevice]:
+    def collect_network(self, network_id: str) -> list[CollectedDevice]:
         """
         Collect all devices in a Meraki network.
 
-        Parameters
-        ----------
-        network_id      : Meraki network ID (e.g. "N_xxxxxxxxxxxx")
-        client_timespan : look-back window (seconds) for the client list used
-                          to build MAC tables.  Default: 24 hours.
+        Note: this does NOT collect Meraki's connected-client data (the
+        computers/phones/etc. plugged into switch ports or associated to
+        APs) — only the network devices themselves (switches, APs,
+        appliances) and their own IPs/interfaces.  Client/MAC collection
+        via getNetworkClients was removed on request: it was slow, prone to
+        503 timeouts on networks with a large historical client count, and
+        the resulting MAC data was for connected end-user devices, not the
+        Meraki equipment this plugin is meant to inventory.
         """
         log.info("Meraki: collecting network %s", network_id)
 
@@ -144,18 +189,20 @@ class MerakiCollector:
             log.warning("Meraki: no devices returned for network %s", network_id)
             return []
 
-        # Clients keyed by (serial, portId) for MAC table building
-        clients_by_port = self._index_clients(network_id, client_timespan)
+        # Build an index of stack memberships: serial → CollectedStackMembership
+        stack_memberships = self._index_stack_memberships(network_id)
 
-        # Topology neighbours (supplement port-status CDP/LLDP)
+        # Topology neighbours (CDP/LLDP) — unrelated to client data, still
+        # used to populate port-to-port neighbour links.
         topology_nbrs = self._build_topology_index(network_id)
 
         results: list[CollectedDevice] = []
         for raw in raw_devices:
             try:
-                dev = self._collect_device(
-                    raw, clients_by_port, topology_nbrs
-                )
+                serial = raw.get("serial", "")
+                dev = self._collect_device(raw, topology_nbrs)
+                if serial in stack_memberships:
+                    dev.stack_membership = stack_memberships[serial]
                 results.append(dev)
             except Exception as exc:
                 serial = raw.get("serial", "?")
@@ -174,7 +221,6 @@ class MerakiCollector:
     def _collect_device(
         self,
         raw: dict,
-        clients_by_port: dict[tuple[str, str], list[dict]],
         topology_nbrs: dict[tuple[str, str], list[dict]],
     ) -> CollectedDevice:
         serial  = raw.get("serial", "")
@@ -198,8 +244,16 @@ class MerakiCollector:
         )
 
         family = dev.family
+
+        # getNetworkDevices doesn't return lanIp for most MV/MG/MT models —
+        # fall back to the per-device management interface endpoint so
+        # cameras, cellular gateways, and sensors still get an IP synced.
+        if not dev.lan_ip and family in ("MV", "MG", "MT"):
+            mgmt = self._get_device_management_interface(serial)
+            dev.lan_ip = self._extract_management_ip(mgmt)
+
         if family == "MS":
-            self._collect_switch(dev, clients_by_port, topology_nbrs)
+            self._collect_switch(dev, topology_nbrs)
         elif family == "MX":
             self._collect_appliance(dev)
         elif family == "MR":
@@ -215,7 +269,6 @@ class MerakiCollector:
     def _collect_switch(
         self,
         dev: CollectedDevice,
-        clients_by_port: dict[tuple[str, str], list[dict]],
         topology_nbrs: dict[tuple[str, str], list[dict]],
     ) -> None:
         ports    = self._get_switch_ports(dev.serial)
@@ -262,15 +315,8 @@ class MerakiCollector:
                             protocol    = proto,
                         ))
 
-            # MAC table from connected clients
-            for client in clients_by_port.get((dev.serial, port_id), []):
-                mac = _normalise_mac(client.get("mac", ""))
-                if mac:
-                    dev.macs.append(CollectedMac(
-                        mac     = mac,
-                        port_id = port_id,
-                        vlan    = client.get("vlan") or 0,
-                    ))
+            # (MAC table building via connected-client data was removed —
+            # see collect_network docstring)
 
         # Topology-based neighbours (fill gaps from port-status CDP/LLDP)
         existing_nbr_keys = {
@@ -325,8 +371,441 @@ class MerakiCollector:
         ))
 
     # ------------------------------------------------------------------
+    # IPAM collection (network-level, not per-device)
+    # ------------------------------------------------------------------
+
+    def collect_network_ipam(
+        self, network_id: str, switch_serials: Optional[list[str]] = None,
+    ) -> CollectedNetworkIpam:
+        """
+        Collect network-level IPAM information for a Meraki network: VLANs
+        (or the single-LAN subnet) from the MX appliance, plus static
+        routes.
+
+        If the network has VLANs enabled (getNetworkApplianceVlansSettings),
+        every VLAN from getNetworkApplianceVlans is returned.  Otherwise the
+        network is on a "single LAN" and the one subnet from
+        getNetworkApplianceSingleLan is returned as a CollectedVlan with
+        vlan_id=0.
+
+        Static routes (getNetworkApplianceStaticRoutes) point at subnets
+        reached via a next-hop gateway rather than a local MX interface —
+        typically Layer 3 VLANs configured on an upstream switch (or switch
+        stack), not on the MX itself.  To recover the VLAN ID and name for
+        these, pass every device serial in this network via switch_serials
+        (not just ones with an "MS" model — some Layer 3 switches, such as
+        Catalyst switches onboarded for Meraki cloud monitoring, report
+        other model strings, so callers should not pre-filter by model):
+        each serial's Layer 3 routing interfaces
+        (getDeviceSwitchRoutingInterfaces) are fetched and matched to each
+        static route by subnet, and the call safely returns nothing for
+        devices that aren't Layer 3 switches.  Switch stacks are handled
+        separately — stacked switches configure Layer 3 routing on the
+        stack itself, not on individual member switches, so per-device
+        lookups return nothing for them.  Every switch stack in the network
+        is discovered via getNetworkSwitchStacks and its routing interfaces
+        are fetched via getNetworkSwitchStackRoutingInterfaces,
+        automatically, with no input needed from the caller.  vlan_id/name
+        on the CollectedStaticRoute is populated when a match is found from
+        either source.
+
+        Networks with no MX appliance (e.g. switch- or AP-only networks)
+        simply return empty lists — the underlying API calls 404 and are
+        swallowed by the SDK wrappers below.
+        """
+        log.info("Meraki: collecting IPAM for network %s", network_id)
+
+        vlans_enabled = self._get_vlans_enabled(network_id)
+
+        if vlans_enabled:
+            raw_vlans = self._get_network_appliance_vlans(network_id)
+            vlans = [self._parse_vlan(v) for v in raw_vlans]
+        else:
+            raw_lan = self._get_network_appliance_single_lan(network_id)
+            vlans = [self._parse_single_lan(raw_lan)] if raw_lan else []
+
+        # Collect Layer 3 routing interfaces from every device serial passed
+        # in (not just recognized MS switches — see docstring above), so
+        # static routes to switch-side VLANs can be matched to their real
+        # VLAN ID/name.  Devices that aren't Layer 3 switches simply return
+        # an empty list here.
+        switch_l3_interfaces = []
+        for serial in (switch_serials or []):
+            switch_l3_interfaces.extend(
+                self._get_device_switch_routing_interfaces(serial)
+            )
+
+        # Also collect Layer 3 routing interfaces from every switch stack in
+        # this network — stacked switches configure L3 on the stack itself,
+        # so this is the only way to see those interfaces.
+        for stack in self._get_network_switch_stacks(network_id):
+            stack_id = stack.get("id")
+            if not stack_id:
+                continue
+            switch_l3_interfaces.extend(
+                self._get_network_switch_stack_routing_interfaces(
+                    network_id, stack_id,
+                )
+            )
+
+        raw_routes = self._get_network_appliance_static_routes(network_id)
+        static_routes = [
+            self._parse_static_route(r, vlans, switch_l3_interfaces)
+            for r in raw_routes
+        ]
+
+        log.info(
+            "Meraki: collected %d VLAN/subnet record(s) and %d static "
+            "route(s) for network %s",
+            len(vlans), len(static_routes), network_id,
+        )
+        return CollectedNetworkIpam(vlans=vlans, static_routes=static_routes)
+
+    @staticmethod
+    def _parse_vlan(raw: dict) -> CollectedVlan:
+        nameservers = raw.get("dnsNameservers") or ""
+        if isinstance(nameservers, list):
+            nameservers = ", ".join(nameservers)
+        return CollectedVlan(
+            vlan_id             = int(raw.get("id") or 0),
+            name                = raw.get("name") or f"VLAN {raw.get('id', '')}",
+            subnet              = raw.get("subnet") or "",
+            appliance_ip        = raw.get("applianceIp") or "",
+            dns_nameservers     = nameservers,
+            dhcp_handling       = raw.get("dhcpHandling") or "",
+            reserved_ip_ranges  = raw.get("reservedIpRanges") or [],
+        )
+
+    @staticmethod
+    def _parse_single_lan(raw: dict) -> CollectedVlan:
+        nameservers = raw.get("dnsNameservers") or ""
+        if isinstance(nameservers, list):
+            nameservers = ", ".join(nameservers)
+        return CollectedVlan(
+            vlan_id             = 0,
+            name                = "LAN",
+            subnet              = raw.get("subnet") or "",
+            appliance_ip        = raw.get("applianceIp") or "",
+            dns_nameservers     = nameservers,
+            dhcp_handling       = raw.get("dhcpHandling") or "",
+            reserved_ip_ranges  = raw.get("reservedIpRanges") or [],
+        )
+
+    def _parse_static_route(
+        self, raw: dict, vlans: list, switch_l3_interfaces: list,
+    ) -> CollectedStaticRoute:
+        """
+        Parse a static route and match its subnet to a Layer 3 VLAN to
+        recover the VLAN ID and name.  Checked in order:
+          1. MX appliance VLANs (rare — usually the MX has no VLAN on a
+             switch-side subnet)
+          2. Switch Layer 3 routing interfaces (the common case — the
+             route's subnet lives on a VLAN interface on an upstream switch)
+        If no match is found, vlan_id/vlan_name stay unset.
+        """
+        subnet = raw.get("subnet") or ""
+        vlan_id = 0
+        vlan_name = ""
+
+        for vlan in vlans:
+            if vlan.subnet == subnet:
+                vlan_id = vlan.vlan_id
+                vlan_name = vlan.name
+                break
+
+        if not vlan_id:
+            for iface in switch_l3_interfaces:
+                if iface.get("subnet") == subnet:
+                    vlan_id = int(iface.get("vlanId") or 0)
+                    vlan_name = iface.get("name") or ""
+                    break
+
+        return CollectedStaticRoute(
+            name        = raw.get("name") or subnet or "",
+            subnet      = subnet,
+            next_hop_ip = raw.get("gatewayIp") or "",
+            enabled     = bool(raw.get("enabled", True)),
+            vlan_id     = vlan_id,
+            vlan_name   = vlan_name,
+        )
+
+    # ------------------------------------------------------------------
     # SDK wrappers
     # ------------------------------------------------------------------
+
+    def _get_vlans_enabled(self, network_id: str) -> bool:
+        try:
+            settings = self.dashboard.appliance.getNetworkApplianceVlansSettings(
+                networkId=network_id
+            )
+            return bool(settings.get("vlansEnabled"))
+        except meraki.exceptions.APIError as exc:
+            # 404 here typically means the network has no MX appliance
+            log.debug(
+                "Meraki: getNetworkApplianceVlansSettings failed for %s: %s",
+                network_id, exc,
+            )
+            return False
+
+    def _get_network_appliance_vlans(self, network_id: str) -> list[dict]:
+        try:
+            return self.dashboard.appliance.getNetworkApplianceVlans(
+                networkId=network_id
+            )
+        except meraki.exceptions.APIError as exc:
+            log.warning(
+                "Meraki: getNetworkApplianceVlans failed for %s: %s",
+                network_id, exc,
+            )
+            return []
+
+    def _get_network_appliance_single_lan(self, network_id: str) -> Optional[dict]:
+        try:
+            return self.dashboard.appliance.getNetworkApplianceSingleLan(
+                networkId=network_id
+            )
+        except meraki.exceptions.APIError as exc:
+            log.debug(
+                "Meraki: getNetworkApplianceSingleLan failed for %s: %s",
+                network_id, exc,
+            )
+            return None
+
+    def _get_network_appliance_static_routes(self, network_id: str) -> list[dict]:
+        try:
+            return self.dashboard.appliance.getNetworkApplianceStaticRoutes(
+                networkId=network_id
+            )
+        except meraki.exceptions.APIError as exc:
+            log.debug(
+                "Meraki: getNetworkApplianceStaticRoutes failed for %s: %s",
+                network_id, exc,
+            )
+            return []
+
+    def _get_device_switch_routing_interfaces(self, serial: str) -> list[dict]:
+        """
+        Get a standalone switch's Layer 3 routing interfaces (VLAN
+        interfaces with an IP address configured), used to recover VLAN
+        ID/name for static routes that point at switch-side subnets.
+        Devices that aren't Layer 3 switches, have no routing interfaces
+        configured, or are members of a switch stack (whose L3 interfaces
+        live on the stack, not the member switch — see
+        _get_network_switch_stack_routing_interfaces), simply return an
+        empty list (the API 404s and is swallowed here).
+        """
+        try:
+            return self.dashboard.switch.getDeviceSwitchRoutingInterfaces(
+                serial=serial
+            )
+        except meraki.exceptions.APIError as exc:
+            log.debug(
+                "Meraki: getDeviceSwitchRoutingInterfaces failed for %s: %s",
+                serial, exc,
+            )
+            return []
+
+    def _get_network_switch_stacks(self, network_id: str) -> list[dict]:
+        """
+        List every switch stack in a network, so its Layer 3 routing
+        interfaces can be fetched separately from standalone switches.
+        Networks with no switch stacks simply return an empty list (the
+        API 404s and is swallowed here).
+        """
+        try:
+            return self.dashboard.switch.getNetworkSwitchStacks(
+                networkId=network_id
+            )
+        except meraki.exceptions.APIError as exc:
+            log.debug(
+                "Meraki: getNetworkSwitchStacks failed for %s: %s",
+                network_id, exc,
+            )
+            return []
+
+    def _get_network_switch_stack_routing_interfaces(
+        self, network_id: str, switch_stack_id: str,
+    ) -> list[dict]:
+        """
+        Get a switch stack's Layer 3 routing interfaces.  Stacked switches
+        configure routing on the stack itself rather than on individual
+        member switches, so this is the only way to see those interfaces —
+        getDeviceSwitchRoutingInterfaces on a stack member returns nothing.
+        Stacks with no L3 configured simply return an empty list (the API
+        404s and is swallowed here).
+        """
+        try:
+            return self.dashboard.switch.getNetworkSwitchStackRoutingInterfaces(
+                networkId=network_id, switchStackId=switch_stack_id,
+            )
+        except meraki.exceptions.APIError as exc:
+            log.debug(
+                "Meraki: getNetworkSwitchStackRoutingInterfaces failed for "
+                "%s/%s: %s",
+                network_id, switch_stack_id, exc,
+            )
+            return []
+
+    # ------------------------------------------------------------------
+    # Wireless collection (network-level, not per-device)
+    # ------------------------------------------------------------------
+
+    def collect_network_wireless(self, network_id: str) -> list[CollectedSsid]:
+        """
+        Collect enabled, named SSIDs configured on a Meraki network's MR
+        access points via getNetworkWirelessSsids.  Meraki always returns
+        15 SSID slots per network whether or not they're used, so disabled
+        slots and ones still at their default "Unconfigured SSID N" name
+        are filtered out here — only SSIDs someone has actually turned on
+        and named are returned.  Networks with no MR APs simply return an
+        empty list (the API call 404s and is swallowed below).
+
+        VLAN association is only meaningful for SSIDs in "Bridge mode" (or
+        "Layer 3 roaming") with `useVlanTagging` enabled — clients get an
+        IP from that VLAN's own DHCP server rather than Meraki's built-in
+        NAT-mode DHCP, so there's a real VLAN to record.  Two sources are
+        checked, in order:
+          1. `defaultVlanId` — the network-wide VLAN, used for APs with no
+             tag-specific override
+          2. `apTagsAndVlanIds` — per-AP-tag VLAN overrides; if every
+             override maps to the same VLAN ID, that's used, otherwise the
+             SSID spans multiple VLANs and none is recorded (ambiguous)
+        SSIDs left in Meraki's default NAT mode (`ipAssignmentMode ==
+        "NAT mode"`) or without VLAN tagging enabled get vlan_id=None,
+        which the syncer leaves unset on the WirelessLAN in NetBox.
+
+        PSKs are intentionally never collected for most SSIDs — auth mode
+        is recorded, but no secrets are pulled into NetBox.  The one
+        exception: an SSID literally named "IoT" (case-insensitive) has its
+        pre-shared key fetched via a dedicated getNetworkWirelessSsid call
+        (the list endpoint used for everything else doesn't reliably
+        include it) and stored on CollectedSsid.psk, which the syncer
+        writes to the WirelessLAN's auth_psk field.  This is a deliberate,
+        narrowly-scoped exception — do not extend it to other SSIDs without
+        an explicit request, since it means a secret lands in NetBox.
+        """
+        raw_ssids = self._get_network_wireless_ssids(network_id)
+        results = []
+        for raw in raw_ssids:
+            name = (raw.get("name") or "").strip()
+            if not raw.get("enabled") or not name or name.startswith("Unconfigured SSID"):
+                continue
+
+            psk = None
+            if name.lower() == "iot":
+                detail = self._get_network_wireless_ssid(network_id, raw.get("number"))
+                psk = (detail or raw).get("psk") or None
+
+            results.append(CollectedSsid(
+                number    = int(raw.get("number", 0)),
+                name      = name,
+                enabled   = True,
+                auth_mode = raw.get("authMode") or "",
+                vlan_id   = self._extract_ssid_vlan_id(raw),
+                psk       = psk,
+            ))
+
+        log.info(
+            "Meraki: collected %d enabled SSID(s) for network %s",
+            len(results), network_id,
+        )
+        return results
+
+    @staticmethod
+    def _extract_ssid_vlan_id(raw: dict) -> Optional[int]:
+        """
+        Work out the single VLAN ID (if any) a bridged SSID's clients land
+        on.  Returns None for NAT-mode SSIDs (Meraki's own DHCP — no VLAN
+        to record), SSIDs without VLAN tagging enabled, or SSIDs whose
+        per-AP-tag overrides disagree (genuinely multiple VLANs, so no
+        single ID is correct).
+        """
+        if raw.get("ipAssignmentMode") == "NAT mode":
+            return None
+        if not raw.get("useVlanTagging"):
+            return None
+
+        tag_overrides = raw.get("apTagsAndVlanIds") or []
+        tag_vlan_ids = {
+            int(t["vlanId"]) for t in tag_overrides
+            if t.get("vlanId") is not None
+        }
+
+        default_vlan = raw.get("defaultVlanId")
+        if default_vlan is not None:
+            tag_vlan_ids.add(int(default_vlan))
+
+        if len(tag_vlan_ids) == 1:
+            return next(iter(tag_vlan_ids))
+
+        # 0 means nothing configured; 2+ means it spans multiple VLANs —
+        # either way there's no single correct VLAN ID to record.
+        return None
+
+    def _get_network_wireless_ssids(self, network_id: str) -> list[dict]:
+        try:
+            return self.dashboard.wireless.getNetworkWirelessSsids(
+                networkId=network_id
+            )
+        except meraki.exceptions.APIError as exc:
+            log.debug(
+                "Meraki: getNetworkWirelessSsids failed for %s: %s",
+                network_id, exc,
+            )
+            return []
+
+    def _get_network_wireless_ssid(
+        self, network_id: str, number,
+    ) -> Optional[dict]:
+        """
+        Fetch a single SSID's full detail, used only to recover the
+        pre-shared key for the "IoT" SSID exception in
+        collect_network_wireless — the list endpoint doesn't reliably
+        include `psk`.  Returns None on any failure so the caller falls
+        back to whatever the list endpoint already returned.
+        """
+        if number is None:
+            return None
+        try:
+            return self.dashboard.wireless.getNetworkWirelessSsid(
+                networkId=network_id, number=number,
+            )
+        except meraki.exceptions.APIError as exc:
+            log.debug(
+                "Meraki: getNetworkWirelessSsid failed for %s/%s: %s",
+                network_id, number, exc,
+            )
+            return None
+
+    def _get_device_management_interface(self, serial: str) -> dict:
+        try:
+            return self.dashboard.devices.getDeviceManagementInterface(
+                serial=serial
+            )
+        except meraki.exceptions.APIError as exc:
+            log.debug(
+                "Meraki: getDeviceManagementInterface failed for %s: %s",
+                serial, exc,
+            )
+            return {}
+
+    @staticmethod
+    def _extract_management_ip(mgmt: dict) -> str:
+        """
+        Pull the first usable IPv4 out of a getDeviceManagementInterface
+        response.  Its shape varies by device family — a flat dict for most
+        types, or wan1/wan2 sub-dicts for devices with dual uplinks — so
+        check the top level and every nested dict for a static or DHCP IP.
+        """
+        if not mgmt:
+            return ""
+        candidates = [mgmt] + [v for v in mgmt.values() if isinstance(v, dict)]
+        for c in candidates:
+            for key in ("staticIp", "ip", "dhcpIp"):
+                val = c.get(key)
+                if val:
+                    return val
+        return ""
 
     def _get_network_devices(self, network_id: str) -> list[dict]:
         try:
@@ -347,19 +826,6 @@ class MerakiCollector:
         except meraki.exceptions.APIError:
             return []
 
-    def _get_network_clients(
-        self, network_id: str, timespan: int
-    ) -> list[dict]:
-        try:
-            return self.dashboard.networks.getNetworkClients(
-                networkId=network_id,
-                timespan=timespan,
-                total_pages="all",
-            )
-        except meraki.exceptions.APIError as exc:
-            log.warning("Meraki: getNetworkClients failed for %s: %s", network_id, exc)
-            return []
-
     def _get_network_topology(self, network_id: str) -> dict:
         try:
             return self.dashboard.networks.getNetworkTopologyLinkLayer(
@@ -368,21 +834,32 @@ class MerakiCollector:
         except meraki.exceptions.APIError:
             return {}
 
-    # ------------------------------------------------------------------
-    # Index builders
-    # ------------------------------------------------------------------
+    def _index_stack_memberships(
+        self, network_id: str
+    ) -> dict[str, CollectedStackMembership]:
+        """
+        Return a dict mapping device serial → CollectedStackMembership for
+        all switches that are part of a Meraki switch stack in this network.
+        Devices not in a stack are not present in the returned dict.
+        """
+        memberships: dict[str, CollectedStackMembership] = {}
+        for stack in self._get_network_switch_stacks(network_id):
+            stack_id = stack.get("id")
+            stack_name = stack.get("name", f"Stack {stack_id}")
+            master_serial = stack.get("serials", [])[0] if stack.get("serials") else ""
 
-    def _index_clients(
-        self, network_id: str, timespan: int
-    ) -> dict[tuple[str, str], list[dict]]:
-        """Return clients keyed by (device_serial, switchport)."""
-        index: dict[tuple[str, str], list[dict]] = {}
-        for client in self._get_network_clients(network_id, timespan):
-            serial    = client.get("recentDeviceSerial") or ""
-            switchport = str(client.get("switchport") or "")
-            if serial and switchport:
-                index.setdefault((serial, switchport), []).append(client)
-        return index
+            # In Meraki's API, the first serial in the list is the master,
+            # the rest are members. serials_by_tag provides role info.
+            serials_by_tag = stack.get("serials_by_tag", {})
+            for i, serial in enumerate(stack.get("serials") or []):
+                role = "master" if i == 0 else "member"
+                memberships[serial] = CollectedStackMembership(
+                    stack_id=stack_id,
+                    stack_name=stack_name,
+                    master_serial=master_serial,
+                    member_role=role,
+                )
+        return memberships
 
     def _build_topology_index(
         self, network_id: str

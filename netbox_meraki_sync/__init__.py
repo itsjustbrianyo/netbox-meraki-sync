@@ -23,7 +23,11 @@ class MerakiSyncConfig(PluginConfig):
         "request_timeout": 30,
 
         # When True, also create IPAM IPAddress records for each device LAN IP.
-        "sync_ip_addresses": False,
+        # IPAM (IP addresses, VLANs, prefixes) is always synced now — these
+        # two settings are unused but left here in case a future version
+        # wants to make them togglable again.
+        "sync_ip_addresses": True,
+        "sync_vlans": True,
 
         # Device role slug used when creating new devices from Meraki data.
         # The role is created automatically if it does not exist.

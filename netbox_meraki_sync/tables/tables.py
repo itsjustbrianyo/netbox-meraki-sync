@@ -16,6 +16,10 @@ class SyncLogTable(NetBoxTable):
     devices_updated = tables.Column(verbose_name="Updated")
     interfaces_synced = tables.Column(verbose_name="Interfaces")
     macs_synced       = tables.Column(verbose_name="MACs")
+    vlans_synced      = tables.Column(verbose_name="VLANs")
+    prefixes_synced   = tables.Column(verbose_name="Prefixes")
+    static_routes_synced = tables.Column(verbose_name="Static Routes")
+    wireless_lans_synced = tables.Column(verbose_name="SSIDs")
 
     class Meta(NetBoxTable.Meta):
         model = NetBoxTable.Meta.model if hasattr(NetBoxTable.Meta, "model") else None
@@ -33,6 +37,10 @@ class SyncLogTable(NetBoxTable):
             "devices_updated",
             "interfaces_synced",
             "macs_synced",
+            "vlans_synced",
+            "prefixes_synced",
+            "static_routes_synced",
+            "wireless_lans_synced",
         )
         default_columns = (
             "network_name",

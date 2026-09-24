@@ -17,8 +17,9 @@ Usage
   # Dry run — show what would change without writing anything
   python manage.py sync_meraki --dry-run
 
-  # Also create IPAM IP address records for device LAN/WAN IPs
-  python manage.py sync_meraki --sync-ips
+  # Regular runs always sync devices, interfaces, MACs, IP addresses, and
+  # each network's MX VLANs/subnets (VLAN + Prefix) — no flags needed.
+  python manage.py sync_meraki
 
   # List all Meraki networks accessible to the API key
   python manage.py sync_meraki --list-networks
@@ -99,21 +100,6 @@ class Command(BaseCommand):
             help="Collect data but do not write anything to NetBox.",
         )
         parser.add_argument(
-            "--sync-ips",
-            action="store_true",
-            help="Also create IPAM IPAddress records for device LAN/WAN IPs.",
-        )
-        parser.add_argument(
-            "--client-timespan",
-            type=int,
-            default=86400,
-            metavar="SECONDS",
-            help=(
-                "How far back (in seconds) to look for Meraki network clients "
-                "when building MAC tables.  Default: 86400 (24 hours)."
-            ),
-        )
-        parser.add_argument(
             "--list-networks",
             action="store_true",
             help=(
@@ -133,9 +119,13 @@ class Command(BaseCommand):
             sys.exit(1)
 
         dry_run         = options["dry_run"]
-        sync_ips        = options["sync_ips"] or bool(_plugin_setting("sync_ip_addresses"))
+        # IP addresses and VLANs/prefixes are synced on every run by default.
+        # --sync-ips / --sync-vlans (or the matching plugin settings) are kept
+        # only in case someone wants to force them on explicitly; they can no
+        # longer be used to turn this off.
+        sync_ips        = True
+        sync_vlans      = True
         network_filter  = options["network"]
-        client_timespan = options["client_timespan"]
         list_networks   = options["list_networks"]
         proxy           = _plugin_setting("http_proxy", "") or ""
         timeout         = _plugin_setting("request_timeout", 30) or 30
@@ -192,8 +182,11 @@ class Command(BaseCommand):
         total_created   = 0
         total_updated   = 0
         total_interfaces = 0
-        total_macs      = 0
         total_ips       = 0
+        total_vlans     = 0
+        total_prefixes  = 0
+        total_static_routes = 0
+        total_wireless_lans = 0
         failed_networks = 0
 
         for site in mapped_sites:
@@ -219,10 +212,7 @@ class Command(BaseCommand):
             )
 
             try:
-                devices = collector.collect_network(
-                    network_id,
-                    client_timespan=client_timespan,
-                )
+                devices = collector.collect_network(network_id)
 
                 # Back-fill the Meraki network name onto the site
                 # (we don't get the name from getNetworkDevices, so we store
@@ -233,22 +223,62 @@ class Command(BaseCommand):
                 )
 
                 syncer.sync_devices(devices, site=site)
+
+                if sync_vlans:
+                    # Try every device, not just ones with an "MS" model
+                    # prefix — some Layer 3 switches (e.g. Catalyst switches
+                    # onboarded for Meraki cloud monitoring) report other
+                    # model strings, and getDeviceSwitchRoutingInterfaces
+                    # safely 404s/returns empty for anything that isn't a
+                    # switch, so there's no harm in trying every serial.
+                    switch_serials = [d.serial for d in devices]
+                    ipam_data = collector.collect_network_ipam(
+                        network_id, switch_serials=switch_serials,
+                    )
+                    self.stdout.write(
+                        f"  Collected {len(ipam_data.vlans)} VLAN/subnet "
+                        f"record(s) and {len(ipam_data.static_routes)} "
+                        f"static route(s) from Meraki"
+                    )
+                    ipam_errors = syncer.sync_ipam(ipam_data, site=site)
+                    for err in ipam_errors:
+                        self.stderr.write(self.style.ERROR(f"  IPAM error: {err}"))
+
+                ssids = collector.collect_network_wireless(network_id)
+                if ssids:
+                    self.stdout.write(f"  Collected {len(ssids)} enabled SSID(s) from Meraki")
+                    wireless_errors = syncer.sync_wireless(ssids, site=site)
+                    for err in wireless_errors:
+                        self.stderr.write(self.style.ERROR(f"  Wireless error: {err}"))
+
                 syncer.close(success=True)
 
                 total_devices    += sync_log.devices_seen
                 total_created    += sync_log.devices_created
                 total_updated    += sync_log.devices_updated
                 total_interfaces += sync_log.interfaces_synced
-                total_macs       += sync_log.macs_synced
                 total_ips        += sync_log.ips_synced
+                total_vlans      += sync_log.vlans_synced
+                total_prefixes   += sync_log.prefixes_synced
+                total_static_routes += sync_log.static_routes_synced
+                total_wireless_lans += sync_log.wireless_lans_synced
 
                 self.stdout.write(self.style.SUCCESS(
                     f"  Done — "
                     f"{sync_log.devices_created} created, "
                     f"{sync_log.devices_updated} updated, "
-                    f"{sync_log.interfaces_synced} interfaces, "
-                    f"{sync_log.macs_synced} MACs"
+                    f"{sync_log.interfaces_synced} interfaces"
                     + (f", {sync_log.ips_synced} IPs" if sync_ips else "")
+                    + (
+                        f", {sync_log.vlans_synced} VLANs, "
+                        f"{sync_log.prefixes_synced} prefixes, "
+                        f"{sync_log.static_routes_synced} static routes"
+                        if sync_vlans else ""
+                    )
+                    + (
+                        f", {sync_log.wireless_lans_synced} SSIDs"
+                        if sync_log.wireless_lans_synced else ""
+                    )
                 ))
 
             except Exception as exc:
@@ -273,9 +303,14 @@ class Command(BaseCommand):
                 f"{total_devices} devices seen, "
                 f"{total_created} created, "
                 f"{total_updated} updated, "
-                f"{total_interfaces} interfaces, "
-                f"{total_macs} MACs"
+                f"{total_interfaces} interfaces"
                 + (f", {total_ips} IPs" if sync_ips else "")
+                + (
+                    f", {total_vlans} VLANs, {total_prefixes} prefixes, "
+                    f"{total_static_routes} static routes"
+                    if sync_vlans else ""
+                )
+                + (f", {total_wireless_lans} SSIDs" if total_wireless_lans else "")
                 + (f"  [{failed_networks} network(s) failed]" if failed_networks else "")
             ))
 

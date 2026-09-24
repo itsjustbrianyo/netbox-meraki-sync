@@ -36,6 +36,10 @@ class SyncLog(models.Model):
     interfaces_synced = models.PositiveIntegerField(default=0)
     macs_synced       = models.PositiveIntegerField(default=0)
     ips_synced        = models.PositiveIntegerField(default=0)
+    vlans_synced      = models.PositiveIntegerField(default=0)
+    prefixes_synced   = models.PositiveIntegerField(default=0)
+    static_routes_synced = models.PositiveIntegerField(default=0)
+    wireless_lans_synced = models.PositiveIntegerField(default=0)
 
     class Meta:
         ordering = ["-started_at"]
