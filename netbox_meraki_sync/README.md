@@ -1,10 +1,6 @@
 # netbox-meraki-sync
 
-Forked and Updated from: [graphworlok](https://github.com/graphworlok/netbox-meraki-sync)
-
-A NetBox 4.x plugin that synchronises Cisco Meraki inventory into NetBox using the official [Meraki Python SDK](https://github.com/meraki/dashboard-api-python). It pulls devices, interfaces, switch stacks, VLANs, subnets, static routes and SSIDs from the Meraki Dashboard and writes them into NetBox DCIM, IPAM and Wireless. 
-
-A read-only Meraki API key is all that is required.
+A NetBox 4.x plugin that synchronises Cisco Meraki inventory into NetBox using the official [Meraki Python SDK](https://github.com/meraki/dashboard-api-python). It pulls devices, interfaces, switch stacks, VLANs, subnets, static routes and SSIDs from the Meraki Dashboard and writes them into NetBox DCIM, IPAM and Wireless. A read-only Meraki API key is all that is required.
 
 Sync is one-way: Meraki is the source of truth and nothing is ever written back to Meraki.
 
@@ -281,6 +277,22 @@ GET /api/plugins/meraki/sync-logs/<id>/
 ```
 
 For object-level detail of what changed, use the NetBox changelog (see [Change logging](#change-logging)).
+
+---
+
+## Starting fresh
+
+`clear_meraki_netbox_standalone.py` removes everything the plugin has created so you can re-sync from a clean slate. It runs from any computer with Python and only needs the NetBox URL and an API token:
+
+```bash
+# Preview what would be deleted
+python3 clear_meraki_netbox_standalone.py --url https://netbox.example.com --token YOUR_TOKEN --dry-run
+
+# Delete
+python3 clear_meraki_netbox_standalone.py --url https://netbox.example.com --token YOUR_TOKEN
+```
+
+It deletes Meraki-tagged Devices, WirelessLANs, VLANs, Prefixes and IP Ranges, plus Virtual Chassis, `* VLANs` / `* WLANs` groups and sync logs. Back up your database and always run `--dry-run` first. VLAN/WLAN groups are matched by name and Virtual Chassis are not filtered by tag, so review the dry-run output carefully if you have any that weren't created by this plugin.
 
 ---
 

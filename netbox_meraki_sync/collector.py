@@ -60,8 +60,9 @@ class CollectedUplink:
     interface:    str              # e.g., "WAN1", "WAN2", "Cellular"
     ip_address:   str = ""         # Public/upstream IP if configured
     gateway_ip:   str = ""         # Upstream gateway
-    failover_role: str = ""        # "primary", "secondary", or ""
-    mode:         str = ""         # "Auto", "Manual" or other config mode
+    failover_role: str = ""        # "primary" (Meraki default uplink) or "secondary"
+    status:       str = ""         # "active", "ready", "failed", "not connected"
+    mode:         str = ""         # How the IP was assigned: "dhcp" or "static"
 
 
 @dataclass
@@ -227,6 +228,9 @@ class MerakiCollector:
             except Exception as exc:
                 serial = raw.get("serial", "?")
                 log.warning("Meraki: failed to collect device %s: %s", serial, exc)
+
+        # MX uplink status/failover roles (one org-level call per network)
+        self._attach_uplinks(network_id, results)
 
         log.info(
             "Meraki: collected %d device(s) from network %s",
@@ -404,57 +408,58 @@ class MerakiCollector:
             dev.ports.append(CollectedPort(
                 port_id="mgmt", name="Management", enabled=True,
             ))
-        
-        # Collect MX uplink configuration (failover settings, etc.)
-        self._collect_uplink_config(dev)
 
-    def _collect_uplink_config(self, dev: CollectedDevice) -> None:
-        """Collect MX uplink failover/load-balancing configuration."""
-        raw_uplinks = self._get_network_appliance_uplink_statuses(dev.serial)
-        for raw_uplink in raw_uplinks:
-            interface = raw_uplink.get("interface", "")
-            if not interface:
+    def _attach_uplinks(self, network_id: str, devices: list[CollectedDevice]) -> None:
+        """
+        Attach MX uplink status to appliance devices in this network.
+
+        Uses the org-level getOrganizationApplianceUplinkStatuses endpoint
+        (filtered to this network) — the old per-network
+        getNetworkApplianceUplinkStatuses no longer exists in current SDKs.
+        Which uplink is "primary" comes from the network's traffic-shaping
+        uplink selection (defaultUplink); every other WAN is "secondary".
+        """
+        appliances = {d.serial: d for d in devices if d.family == "MX"}
+        if not appliances:
+            return
+
+        org_id = self._get_network_org_id(network_id)
+        if not org_id:
+            return
+
+        statuses = self._get_org_appliance_uplink_statuses(org_id, network_id)
+        default_uplink = self._get_network_default_uplink(network_id)
+
+        for entry in statuses:
+            dev = appliances.get(entry.get("serial", ""))
+            if dev is None:
                 continue
-            
-            uplink = CollectedUplink(
-                interface     = interface,
-                ip_address    = raw_uplink.get("ip") or "",
-                gateway_ip    = raw_uplink.get("gateway") or "",
-                failover_role = raw_uplink.get("role") or "",
-                mode          = raw_uplink.get("mode") or "",
-            )
-            dev.uplinks.append(uplink)
+            for raw in entry.get("uplinks") or []:
+                iface = raw.get("interface") or ""
+                if not iface:
+                    continue
+                if default_uplink:
+                    role = "primary" if iface == default_uplink else "secondary"
+                else:
+                    role = ""
+                dev.uplinks.append(CollectedUplink(
+                    interface     = iface,
+                    ip_address    = raw.get("ip") or raw.get("publicIp") or "",
+                    gateway_ip    = raw.get("gateway") or "",
+                    failover_role = role,
+                    status        = raw.get("status") or "",
+                    mode          = raw.get("ipAssignedBy") or "",
+                ))
 
     def _collect_ap(self, dev: CollectedDevice, raw: dict) -> None:
-        """MR access point — radio interfaces with wireless config."""
-        # Collect radio status/config for each radio on this AP
-        radio_status = self._get_device_wireless_status(dev.serial)
-        
-        # APs typically have radio0 and sometimes radio1 (dual-band)
-        # If we have radio_status, use it; otherwise create a default radio0
-        if radio_status:
-            for radio_data in radio_status.get("radios", []):
-                radio_num = radio_data.get("index", 0)
-                port = CollectedPort(
-                    port_id      = f"radio{radio_num}",
-                    name         = f"Radio {radio_num}",
-                    description  = raw.get("model", ""),
-                    enabled      = True,
-                    connected    = True,
-                    radio_band   = radio_data.get("band", ""),      # "2.4", "5", "6"
-                    radio_channel = str(radio_data.get("channel", "")),  # e.g., "1", "36"
-                    radio_power  = int(radio_data.get("txPower") or 0),  # dBm
-                )
-                dev.ports.append(port)
-        else:
-            # Fallback if wireless status unavailable
-            dev.ports.append(CollectedPort(
-                port_id="radio0",
-                name="Radio 0",
-                description=raw.get("model", ""),
-                enabled=True,
-                connected=True,
-            ))
+        """MR access point — a single radio interface."""
+        dev.ports.append(CollectedPort(
+            port_id="radio0",
+            name="Radio 0",
+            description=raw.get("model", ""),
+            enabled=True,
+            connected=True,
+        ))
 
     # ------------------------------------------------------------------
     # IPAM collection (network-level, not per-device)
@@ -669,37 +674,44 @@ class MerakiCollector:
             )
             return []
 
-    def _get_network_appliance_uplink_statuses(self, network_id: str) -> list[dict]:
-        """
-        Get uplink status/config for an MX appliance — includes failover role,
-        IP configuration, uplink mode.  Returns empty list on error or for
-        non-MX devices or if the method is not available in this SDK version.
-        """
+    def _get_network_org_id(self, network_id: str) -> str:
+        """Organisation ID that owns a network (cached)."""
+        cache = self.__dict__.setdefault("_network_org_cache", {})
+        if network_id not in cache:
+            try:
+                net = self.dashboard.networks.getNetwork(networkId=network_id)
+                cache[network_id] = (net or {}).get("organizationId", "") or ""
+            except (meraki.exceptions.APIError, AttributeError) as exc:
+                log.debug("Meraki: getNetwork failed for %s: %s", network_id, exc)
+                cache[network_id] = ""
+        return cache[network_id]
+
+    def _get_org_appliance_uplink_statuses(self, org_id: str, network_id: str) -> list[dict]:
+        """Uplink status for every MX in one network.  Empty list on error."""
         try:
-            return self.dashboard.appliance.getNetworkApplianceUplinkStatuses(
-                networkId=network_id
-            )
+            return self.dashboard.appliance.getOrganizationApplianceUplinkStatuses(
+                organizationId=org_id, networkIds=[network_id], total_pages="all",
+            ) or []
         except (meraki.exceptions.APIError, AttributeError) as exc:
             log.debug(
-                "Meraki: getNetworkApplianceUplinkStatuses failed for %s: %s",
+                "Meraki: getOrganizationApplianceUplinkStatuses failed for %s: %s",
                 network_id, exc,
             )
             return []
 
-    def _get_device_wireless_status(self, serial: str) -> Optional[dict]:
-        """
-        Get wireless radio status for an AP — includes band, channel, TX power,
-        and other radio configuration. Returns None on error or for non-AP
-        devices or if the method is not available in this SDK version.
-        """
+    def _get_network_default_uplink(self, network_id: str) -> str:
+        """Configured primary uplink (e.g. "wan1"), or "" if unavailable."""
         try:
-            return self.dashboard.wireless.getDeviceWirelessStatus(serial=serial)
+            sel = self.dashboard.appliance.getNetworkApplianceTrafficShapingUplinkSelection(
+                networkId=network_id,
+            )
+            return (sel or {}).get("defaultUplink") or ""
         except (meraki.exceptions.APIError, AttributeError) as exc:
             log.debug(
-                "Meraki: getDeviceWirelessStatus failed for %s: %s",
-                serial, exc,
+                "Meraki: getNetworkApplianceTrafficShapingUplinkSelection failed for %s: %s",
+                network_id, exc,
             )
-            return None
+            return ""
 
     def _get_device_switch_routing_interfaces(self, serial: str) -> list[dict]:
         """

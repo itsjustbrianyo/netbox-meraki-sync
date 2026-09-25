@@ -13,7 +13,7 @@ dcim.DeviceRole           — "Network" (or plugin default_device_role setting)
 dcim.Device               — one per Meraki serial; matched by serial first; primary_ip4 set from LAN/WAN1/WAN2 when sync_ips is on
 dcim.Interface            — one per port; type derived from model family
 dcim.MACAddress           — one per unique MAC; linked to interface
-ipam.IPAddress            — optional; created when sync_ip_addresses=True
+ipam.IPAddress            — device LAN IPs and MX WAN IPs (/32)
 ipam.VLAN                 — optional; created per network VLAN when sync_vlans=True (skipped for single-LAN networks)
 ipam.VLANGroup            — one per site ("{site} VLANs"), scoping VLAN IDs; inherits site tags
 ipam.Prefix               — optional; created per VLAN subnet, single-LAN subnet, and per enabled static route
@@ -31,12 +31,14 @@ These custom fields are created by signals.py on plugin startup.
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Optional
 
 from django.db import transaction
 from django.utils.text import slugify
+from django.contrib.contenttypes.models import ContentType
 
 from .collector import (
     CollectedDevice, CollectedVlan, CollectedStaticRoute,
@@ -314,6 +316,8 @@ class MerakiSyncer:
             self.log.wireless_lans_synced += 1
             log.info("Syncer: created WirelessLAN %s", cs.name)
         else:
+            if not self.dry_run and hasattr(wlan, "snapshot"):
+                wlan.snapshot()  # pre-change state for changelog diff
             changed = []
             if auth_type and wlan.auth_type != auth_type:
                 wlan.auth_type = auth_type
@@ -405,7 +409,6 @@ class MerakiSyncer:
         )
 
         tenant = site.tenant if site else None
-
         if device is None:
             if not self.dry_run:
                 device = Device.objects.create(
@@ -416,10 +419,14 @@ class MerakiSyncer:
                     site        = site,
                     tenant      = tenant,  # Inherits Tenant from parent Site
                     status      = "active",
+                    latitude    = site.latitude if site else None,
+                    longitude   = site.longitude if site else None,
                 )
             self.log.devices_created += 1
             log.info("Syncer: created device %s (%s)", dev.name, dev.serial)
         else:
+            if not self.dry_run and hasattr(device, "snapshot"):
+                device.snapshot()  # pre-change state for changelog diff
             changed = []
             if device.name != dev.name:
                 device.name = dev.name
@@ -439,6 +446,17 @@ class MerakiSyncer:
             if device.status != "active":
                 device.status = "active"
                 changed.append("status")
+            
+            # Sync GPS coordinates from parent Site
+            site_lat = site.latitude if site else None
+            site_lon = site.longitude if site else None
+            if device.latitude != site_lat:
+                device.latitude = site_lat
+                changed.append("latitude")
+            if device.longitude != site_lon:
+                device.longitude = site_lon
+                changed.append("longitude")
+            
             if changed and not self.dry_run:
                 device.save(update_fields=changed)
             self.log.devices_updated += 1
@@ -557,11 +575,17 @@ class MerakiSyncer:
                     speed      = self._speed_to_netbox_value(port.speed_mbps),
                     duplex     = port.duplex or "auto",
                     mode       = self._vlan_mode_to_netbox(port.vlan_mode, port.vlan_id),
-                    tagged_vlans = self._parse_allowed_vlans(port.allowed_vlans, device.site) if port.vlan_mode == "trunk" else [],
                     untagged_vlan = self._get_vlan_by_id(port.vlan_id, device.site) if port.vlan_mode == "access" and port.vlan_id else None,
                 )
+                # Set M2M relationships after creation
+                if port.vlan_mode == "trunk" and port.allowed_vlans:
+                    tagged = self._parse_allowed_vlans(port.allowed_vlans, device.site)
+                    if tagged:
+                        iface.tagged_vlans.set(tagged)
             self.log.interfaces_synced += 1
         else:
+            if not self.dry_run and hasattr(iface, "snapshot"):
+                iface.snapshot()  # pre-change state for changelog diff
             changed = []
             if iface.enabled != port.enabled:
                 iface.enabled = port.enabled
@@ -587,23 +611,32 @@ class MerakiSyncer:
                 iface.mode = nb_mode
                 changed.append("mode")
             
-            # Update tagged/untagged VLANs
-            if port.vlan_mode == "trunk" and port.allowed_vlans:
-                tagged = self._parse_allowed_vlans(port.allowed_vlans, device.site)
-                # Compare by VLAN IDs
-                existing_tagged_ids = set(v.vid for v in iface.tagged_vlans.all()) if iface.tagged_vlans else set()
-                new_tagged_ids = set(v.vid for v in tagged) if tagged else set()
-                if existing_tagged_ids != new_tagged_ids:
-                    iface.tagged_vlans.set(tagged)
-                    changed.append("tagged_vlans")
-            elif port.vlan_mode == "access" and port.vlan_id:
+            # Update untagged VLAN (scalar field)
+            if port.vlan_mode == "access" and port.vlan_id:
                 untagged = self._get_vlan_by_id(port.vlan_id, device.site)
                 if iface.untagged_vlan != untagged:
                     iface.untagged_vlan = untagged
                     changed.append("untagged_vlan")
+            elif port.vlan_mode != "access" and iface.untagged_vlan is not None:
+                iface.untagged_vlan = None
+                changed.append("untagged_vlan")
             
             if changed and not self.dry_run:
                 iface.save(update_fields=changed)
+            
+            # Update tagged VLANs (M2M field) separately
+            if not self.dry_run:
+                if port.vlan_mode == "trunk" and port.allowed_vlans:
+                    tagged = self._parse_allowed_vlans(port.allowed_vlans, device.site)
+                    # Compare by VLAN IDs
+                    existing_tagged_ids = set(v.vid for v in iface.tagged_vlans.all()) if iface.tagged_vlans else set()
+                    new_tagged_ids = set(v.vid for v in tagged) if tagged else set()
+                    if existing_tagged_ids != new_tagged_ids:
+                        iface.tagged_vlans.set(tagged)
+                elif iface.tagged_vlans.exists():
+                    # Clear tagged VLANs if no longer trunk mode
+                    iface.tagged_vlans.clear()
+            
             self.log.interfaces_synced += 1
 
         # Write PoE configuration to custom fields
@@ -689,6 +722,8 @@ class MerakiSyncer:
                 log.debug("Syncer: could not create IP %s: %s", address, exc)
                 return
         else:
+            if not self.dry_run and hasattr(ip_obj, "snapshot"):
+                ip_obj.snapshot()  # pre-change state for changelog diff
             changed = []
             if str(ip_obj.address) != address:
                 ip_obj.address = address
@@ -783,10 +818,12 @@ class MerakiSyncer:
 
         # Build a summary of uplink config for each interface
         uplink_summary = []
+        names = {"wan1": "WAN 1", "wan2": "WAN 2", "cellular": "Cellular"}
         for ul in uplinks:
-            summary = f"{ul.interface}"
-            if ul.failover_role:
-                summary += f" ({ul.failover_role})"
+            summary = names.get(ul.interface, ul.interface)
+            details = [d for d in (ul.failover_role, ul.status) if d]
+            if details:
+                summary += f" ({', '.join(details)})"
             uplink_summary.append(summary)
 
         if uplink_summary:
@@ -977,6 +1014,8 @@ class MerakiSyncer:
             self.log.vlans_synced += 1
             log.info("Syncer: created VLAN %s (%s)", cv.vlan_id, cv.name)
         else:
+            if not self.dry_run and hasattr(vlan, "snapshot"):
+                vlan.snapshot()  # pre-change state for changelog diff
             if vlan.name != cv.name:
                 vlan.name = cv.name
                 vlan.save(update_fields=["name"])
@@ -1174,6 +1213,8 @@ class MerakiSyncer:
                 self.log.prefixes_synced += 1
             log.info("Syncer: created prefix %s", subnet)
         else:
+            if not self.dry_run and hasattr(prefix, "snapshot"):
+                prefix.snapshot()  # pre-change state for changelog diff
             changed = []
             if vlan is not None and prefix.vlan_id != vlan.pk:
                 prefix.vlan = vlan

@@ -5,7 +5,7 @@ class MerakiSyncConfig(PluginConfig):
     name = "netbox_meraki_sync"
     verbose_name = "Meraki Sync"
     description = "Synchronise Cisco Meraki network devices into NetBox"
-    version = "0.1.0"
+    version = "1.2.0"
     author = "NetBox Meraki Sync"
     base_url = "meraki"
     min_version = "4.0.0"
@@ -22,21 +22,13 @@ class MerakiSyncConfig(PluginConfig):
         # Meraki API request timeout in seconds.
         "request_timeout": 30,
 
-        # When True, also create IPAM IPAddress records for each device LAN IP.
-        # IPAM (IP addresses, VLANs, prefixes) is always synced now — these
-        # two settings are unused but left here in case a future version
-        # wants to make them togglable again.
-        "sync_ip_addresses": True,
-        "sync_vlans": True,
-
         # Device role slug used when creating new devices from Meraki data.
         # The role is created automatically if it does not exist.
         "default_device_role": "network",
 
-        # NetBox site slug used for devices whose mapped NetBox site cannot be
-        # determined.  Leave empty to skip devices with no site match rather
-        # than assigning a fallback.
-        "fallback_site_slug": "",
+        # NetBox username that changelog entries are attributed to.
+        # Created automatically as an inactive account if it doesn't exist.
+        "changelog_username": "meraki-sync",
     }
 
     def ready(self):

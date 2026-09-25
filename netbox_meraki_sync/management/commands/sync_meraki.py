@@ -32,7 +32,6 @@ environment variable):
   PLUGINS_CONFIG = {
       "netbox_meraki_sync": {
           "meraki_api_key": "your-api-key",
-          "sync_ip_addresses": False,
           "http_proxy": None,
       }
   }
@@ -60,6 +59,7 @@ from ...collector import MerakiCollector
 from ...models import SyncLog
 from ...signals import _ensure_site_custom_fields
 from ...syncer import MerakiSyncer, get_mapped_sites, update_site_meraki_name
+from ...change_logging import change_logging, DEFAULT_USERNAME
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +98,15 @@ class Command(BaseCommand):
             "--dry-run",
             action="store_true",
             help="Collect data but do not write anything to NetBox.",
+        )
+        parser.add_argument(
+            "--user",
+            default=None,
+            help=(
+                "NetBox username that changes are attributed to in the "
+                "changelog.  Default: plugin setting changelog_username, "
+                f"or '{DEFAULT_USERNAME}' (created automatically, inactive)."
+            ),
         )
         parser.add_argument(
             "--list-networks",
@@ -189,104 +198,112 @@ class Command(BaseCommand):
         total_wireless_lans = 0
         failed_networks = 0
 
-        for site in mapped_sites:
-            network_id = site.custom_field_data["meraki_network_id"]
-            site_name  = site.name
+        changelog_user = (
+            options.get("user")
+            or _plugin_setting("changelog_username", DEFAULT_USERNAME)
+            or DEFAULT_USERNAME
+        )
+        # All writes below run inside NetBox's change-tracking context so
+        # they appear in the changelog (one request ID per sync run).
+        with change_logging(changelog_user, enabled=not dry_run):
+            for site in mapped_sites:
+                network_id = site.custom_field_data["meraki_network_id"]
+                site_name  = site.name
 
-            self.stdout.write(f"\n[{network_id}] → site: {site_name}")
+                self.stdout.write(f"\n[{network_id}] → site: {site_name}")
 
-            # Create a SyncLog entry for this network
-            sync_log = SyncLog(
-                network_id   = network_id,
-                site_name    = site_name,
-                status       = SyncStatusChoices.RUNNING,
-            )
-            if not dry_run:
-                sync_log.save()
+                # Create a SyncLog entry for this network
+                sync_log = SyncLog(
+                    network_id   = network_id,
+                    site_name    = site_name,
+                    status       = SyncStatusChoices.RUNNING,
+                )
+                if not dry_run:
+                    sync_log.save()
 
-            syncer = MerakiSyncer(
-                sync_log          = sync_log,
-                dry_run           = dry_run,
-                sync_ips          = sync_ips,
-                default_role_slug = role_slug,
-            )
-
-            try:
-                devices = collector.collect_network(network_id)
-
-                # Back-fill the Meraki network name onto the site
-                # (we don't get the name from getNetworkDevices, so we store
-                # whatever the user populated — or leave it to be set manually)
-
-                self.stdout.write(
-                    f"  Collected {len(devices)} device(s) from Meraki"
+                syncer = MerakiSyncer(
+                    sync_log          = sync_log,
+                    dry_run           = dry_run,
+                    sync_ips          = sync_ips,
+                    default_role_slug = role_slug,
                 )
 
-                syncer.sync_devices(devices, site=site)
+                try:
+                    devices = collector.collect_network(network_id)
 
-                if sync_vlans:
-                    # Try every device, not just ones with an "MS" model
-                    # prefix — some Layer 3 switches (e.g. Catalyst switches
-                    # onboarded for Meraki cloud monitoring) report other
-                    # model strings, and getDeviceSwitchRoutingInterfaces
-                    # safely 404s/returns empty for anything that isn't a
-                    # switch, so there's no harm in trying every serial.
-                    switch_serials = [d.serial for d in devices]
-                    ipam_data = collector.collect_network_ipam(
-                        network_id, switch_serials=switch_serials,
-                    )
+                    # Back-fill the Meraki network name onto the site
+                    # (we don't get the name from getNetworkDevices, so we store
+                    # whatever the user populated — or leave it to be set manually)
+
                     self.stdout.write(
-                        f"  Collected {len(ipam_data.vlans)} VLAN/subnet "
-                        f"record(s) and {len(ipam_data.static_routes)} "
-                        f"static route(s) from Meraki"
+                        f"  Collected {len(devices)} device(s) from Meraki"
                     )
-                    ipam_errors = syncer.sync_ipam(ipam_data, site=site)
-                    for err in ipam_errors:
-                        self.stderr.write(self.style.ERROR(f"  IPAM error: {err}"))
 
-                ssids = collector.collect_network_wireless(network_id)
-                if ssids:
-                    self.stdout.write(f"  Collected {len(ssids)} enabled SSID(s) from Meraki")
-                    wireless_errors = syncer.sync_wireless(ssids, site=site)
-                    for err in wireless_errors:
-                        self.stderr.write(self.style.ERROR(f"  Wireless error: {err}"))
+                    syncer.sync_devices(devices, site=site)
 
-                syncer.close(success=True)
+                    if sync_vlans:
+                        # Try every device, not just ones with an "MS" model
+                        # prefix — some Layer 3 switches (e.g. Catalyst switches
+                        # onboarded for Meraki cloud monitoring) report other
+                        # model strings, and getDeviceSwitchRoutingInterfaces
+                        # safely 404s/returns empty for anything that isn't a
+                        # switch, so there's no harm in trying every serial.
+                        switch_serials = [d.serial for d in devices]
+                        ipam_data = collector.collect_network_ipam(
+                            network_id, switch_serials=switch_serials,
+                        )
+                        self.stdout.write(
+                            f"  Collected {len(ipam_data.vlans)} VLAN/subnet "
+                            f"record(s) and {len(ipam_data.static_routes)} "
+                            f"static route(s) from Meraki"
+                        )
+                        ipam_errors = syncer.sync_ipam(ipam_data, site=site)
+                        for err in ipam_errors:
+                            self.stderr.write(self.style.ERROR(f"  IPAM error: {err}"))
 
-                total_devices    += sync_log.devices_seen
-                total_created    += sync_log.devices_created
-                total_updated    += sync_log.devices_updated
-                total_interfaces += sync_log.interfaces_synced
-                total_ips        += sync_log.ips_synced
-                total_vlans      += sync_log.vlans_synced
-                total_prefixes   += sync_log.prefixes_synced
-                total_static_routes += sync_log.static_routes_synced
-                total_wireless_lans += sync_log.wireless_lans_synced
+                    ssids = collector.collect_network_wireless(network_id)
+                    if ssids:
+                        self.stdout.write(f"  Collected {len(ssids)} enabled SSID(s) from Meraki")
+                        wireless_errors = syncer.sync_wireless(ssids, site=site)
+                        for err in wireless_errors:
+                            self.stderr.write(self.style.ERROR(f"  Wireless error: {err}"))
 
-                self.stdout.write(self.style.SUCCESS(
-                    f"  Done — "
-                    f"{sync_log.devices_created} created, "
-                    f"{sync_log.devices_updated} updated, "
-                    f"{sync_log.interfaces_synced} interfaces"
-                    + (f", {sync_log.ips_synced} IPs" if sync_ips else "")
-                    + (
-                        f", {sync_log.vlans_synced} VLANs, "
-                        f"{sync_log.prefixes_synced} prefixes, "
-                        f"{sync_log.static_routes_synced} static routes"
-                        if sync_vlans else ""
-                    )
-                    + (
-                        f", {sync_log.wireless_lans_synced} SSIDs"
-                        if sync_log.wireless_lans_synced else ""
-                    )
-                ))
+                    syncer.close(success=True)
 
-            except Exception as exc:
-                msg = f"Sync failed for network {network_id}: {exc}"
-                logger.exception(msg)
-                syncer.close(success=False, message=str(exc))
-                self.stderr.write(self.style.ERROR(f"  ERROR: {exc}"))
-                failed_networks += 1
+                    total_devices    += sync_log.devices_seen
+                    total_created    += sync_log.devices_created
+                    total_updated    += sync_log.devices_updated
+                    total_interfaces += sync_log.interfaces_synced
+                    total_ips        += sync_log.ips_synced
+                    total_vlans      += sync_log.vlans_synced
+                    total_prefixes   += sync_log.prefixes_synced
+                    total_static_routes += sync_log.static_routes_synced
+                    total_wireless_lans += sync_log.wireless_lans_synced
+
+                    self.stdout.write(self.style.SUCCESS(
+                        f"  Done — "
+                        f"{sync_log.devices_created} created, "
+                        f"{sync_log.devices_updated} updated, "
+                        f"{sync_log.interfaces_synced} interfaces"
+                        + (f", {sync_log.ips_synced} IPs" if sync_ips else "")
+                        + (
+                            f", {sync_log.vlans_synced} VLANs, "
+                            f"{sync_log.prefixes_synced} prefixes, "
+                            f"{sync_log.static_routes_synced} static routes"
+                            if sync_vlans else ""
+                        )
+                        + (
+                            f", {sync_log.wireless_lans_synced} SSIDs"
+                            if sync_log.wireless_lans_synced else ""
+                        )
+                    ))
+
+                except Exception as exc:
+                    msg = f"Sync failed for network {network_id}: {exc}"
+                    logger.exception(msg)
+                    syncer.close(success=False, message=str(exc))
+                    self.stderr.write(self.style.ERROR(f"  ERROR: {exc}"))
+                    failed_networks += 1
 
         # ------------------------------------------------------------------
         # Summary
