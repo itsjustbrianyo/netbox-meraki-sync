@@ -260,27 +260,49 @@ python3 manage.py sync_meraki --user jsmith
 | `--user NAME` | NetBox username for changelog entries |
 | `--list-networks` | List networks visible to the API key and exit |
 
-### Scheduling
-
-```
-# /etc/cron.d/netbox-meraki-sync — sync every 4 hours
-0 */4 * * * netbox /opt/netbox/venv/bin/python /opt/netbox/netbox/manage.py sync_meraki >> /var/log/netbox/meraki_sync.log 2>&1
-```
-
 ---
-
-## Viewing sync results
-
-**Plugins → Meraki Sync → Sync Logs** shows the history of sync runs with per-network counts of devices, interfaces, IPs, VLANs, prefixes, static routes and SSIDs.
-
-Sync logs are also available through the REST API:
-
+ 
+## Running and scheduling from the NetBox UI
+ 
+The repository includes a NetBox custom script, `meraki_helper_script.py`, that runs the same sync from the web interface. It runs on NetBox's background worker, so it can be triggered with a button or scheduled to repeat. No cron needed.
+ 
+### Install the script
+ 
+1. Go to **Customization → Scripts → Add**.
+2. Upload `meraki_helper_script.py`.
+3. It appears in the scripts list as **Meraki Sync**.
+Uploading and running scripts requires admin rights or the matching script permissions. The NetBox background worker must be running:
+ 
+```bash
+systemctl status netbox-rq
 ```
-GET /api/plugins/meraki/sync-logs/
-GET /api/plugins/meraki/sync-logs/<id>/
-```
-
-For object-level detail of what changed, use the NetBox changelog (see [Change logging](#change-logging)).
+ 
+### Run on demand
+ 
+Open **Meraki Sync** and set:
+ 
+| Field | Description |
+|---|---|
+| **Site** | Sync one site. Leave blank to sync every site with a Meraki Network ID. |
+| **Dry run** | Collect from Meraki without writing anything to NetBox. |
+| **Commit changes** | Must be **ticked**. If it is off, NetBox rolls back everything the script writes, and the log shows a warning. |
+ 
+Click **Run Script**. The sync output appears in the job log, and every change is recorded in the changelog, attributed to the user who ran it.
+ 
+### Schedule recurring syncs
+ 
+On the same run page, under **Script Execution Parameters**:
+ 
+| Field | Example |
+|---|---|
+| **Schedule at** | First run time, e.g. tonight at 02:00 |
+| **Recurs every** | Interval in minutes: `240` for every 4 hours, `1440` for daily |
+ 
+Make sure **Commit changes** is ticked before scheduling. A scheduled job keeps the settings it was created with, so to change them, delete the job and schedule it again.
+ 
+Scheduled and past runs are listed under **Operations → Jobs**, where you can view each run's log or delete the schedule. Scheduled runs are attributed in the changelog to the user who created the schedule.
+ 
+The script allows up to one hour per run, so a full sync across many sites isn't cut off by NetBox's default job timeout.
 
 ---
 
