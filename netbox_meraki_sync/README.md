@@ -37,14 +37,16 @@ VLAN assignments are only made when the matching VLAN already exists in the site
 
 | NetBox object | Source / behaviour |
 |---|---|
+| `ipam.VRF` | One per site, named `{site} VRF`, contains all VLANs and Prefixes for that site |
 | `ipam.VLANGroup` | One per site, named `{site} VLANs`, scoped to the site |
-| `ipam.VLAN` | MX appliance VLANs, plus Layer 3 VLANs found on switches and switch stacks |
-| `ipam.Prefix` | Each VLAN subnet, single-LAN subnet and enabled static route, linked to its VLAN where one exists |
+| `ipam.VLAN` | MX appliance VLANs, plus Layer 3 VLANs found on switches and switch stacks, scoped to the site's VRF |
+| `ipam.Prefix` | Each VLAN subnet, single-LAN subnet and enabled static route, scoped to the site's VRF and linked to its VLAN where one exists |
 | `ipam.IPRange` | Usable host range of each synced subnet (network and broadcast excluded) |
 | `ipam.IPAddress` | Device LAN IPs at the subnet's prefix length; MX WAN IPs as `/32` |
 
 Notes:
 
+- All VLANs and Prefixes are scoped to a per-site VRF named `{site name} VRF`. This allows the same subnet to exist on multiple sites without collision — e.g. `10.254.254.0/24` for IoT can be deployed on every site, with each one properly scoped to its own VRF.
 - Networks without VLANs enabled ("single LAN") get a Prefix and IP Range but no VLAN object.
 - Static routes are matched to Layer 3 interfaces on switches and switch stacks so their Prefix is linked to the correct VLAN (e.g. `172.17.205.0/24` → VLAN 205).
 - Layer 3 interfaces named `Reserved`, `Reserved1`, `Reserved 2`, etc. don't create VLANs, to avoid name collisions. Their Prefix and IP Range are still created.
@@ -231,7 +233,7 @@ While you're on the Site, set its **Tenant**, **Tags** and **latitude/longitude*
 
 ---
 
-## Running a sync
+## Running a sync from the command line
 
 ```bash
 cd /opt/netbox/netbox
@@ -256,12 +258,50 @@ python3 manage.py sync_meraki --user jsmith
 | `--user NAME` | NetBox username for changelog entries |
 | `--list-networks` | List networks visible to the API key and exit |
 
-### Scheduling
+---
 
+## Running and scheduling from the NetBox UI
+
+The repository includes a NetBox custom script, `scripts/meraki_sync_script.py`, that runs the same sync from the web interface. It runs on NetBox's background worker, so it can be triggered with a button or scheduled to repeat. No cron needed.
+
+### Install the script
+
+1. Go to **Customization → Scripts → Add**.
+2. Upload `scripts/meraki_sync_script.py`.
+3. It appears in the scripts list as **Meraki Sync**.
+
+Uploading and running scripts requires admin rights or the matching script permissions. The NetBox background worker must be running:
+
+```bash
+systemctl status netbox-rq
 ```
-# /etc/cron.d/netbox-meraki-sync — sync every 4 hours
-0 */4 * * * netbox /opt/netbox/venv/bin/python /opt/netbox/netbox/manage.py sync_meraki >> /var/log/netbox/meraki_sync.log 2>&1
-```
+
+### Run on demand
+
+Open **Meraki Sync** and set:
+
+| Field | Description |
+|---|---|
+| **Site** | Sync one site. Leave blank to sync every site with a Meraki Network ID. |
+| **Dry run** | Collect from Meraki without writing anything to NetBox. |
+| **Commit changes** | Must be **ticked**. If it is off, NetBox rolls back everything the script writes, and the log shows a warning. |
+
+Click **Run Script**. The sync output appears in the job log, and every change is recorded in the changelog, attributed to the user who ran it.
+
+### Schedule recurring syncs
+
+On the same run page, under **Script Execution Parameters**:
+
+| Field | Example |
+|---|---|
+| **Schedule at** | First run time, e.g. tonight at 02:00 |
+| **Recurs every** | Interval in minutes: `240` for every 4 hours, `1440` for daily |
+
+Make sure **Commit changes** is ticked before scheduling. A scheduled job keeps the settings it was created with, so to change them, delete the job and schedule it again.
+
+Scheduled and past runs are listed under **Operations → Jobs**, where you can view each run's log or delete the schedule. Scheduled runs are attributed in the changelog to the user who created the schedule.
+
+The script allows up to one hour per run, so a full sync across many sites isn't cut off by NetBox's default job timeout.
 
 ---
 
@@ -341,4 +381,7 @@ netbox_meraki_sync/
 ├── tables/
 ├── views/
 └── templates/netbox_meraki_sync/
+
+scripts/
+└── meraki_sync_script.py    NetBox custom script for UI runs and scheduling
 ```

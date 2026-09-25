@@ -250,7 +250,7 @@ class Command(BaseCommand):
                         # switch, so there's no harm in trying every serial.
                         switch_serials = [d.serial for d in devices]
                         ipam_data = collector.collect_network_ipam(
-                            network_id, switch_serials=switch_serials,
+                            network_id, site_name=site.name, switch_serials=switch_serials,
                         )
                         self.stdout.write(
                             f"  Collected {len(ipam_data.vlans)} VLAN/subnet "

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "netbox-meraki-sync"
-version = "1.2.0"
+version = "1.3.0"
 description = "NetBox plugin to synchronise Cisco Meraki networks into NetBox"
 requires-python = ">=3.10"
 dependencies = [

@@ -1,19 +1,15 @@
 # netbox-meraki-sync
-
-Forked and Updated from: [graphworlok](https://github.com/graphworlok/netbox-meraki-sync)
-
-A NetBox 4.x plugin that synchronises Cisco Meraki inventory into NetBox using the official [Meraki Python SDK](https://github.com/meraki/dashboard-api-python). It pulls devices, interfaces, switch stacks, VLANs, subnets, static routes and SSIDs from the Meraki Dashboard and writes them into NetBox DCIM, IPAM and Wireless. 
-
-A read-only Meraki API key is all that is required.
-
+ 
+A NetBox 4.x plugin that synchronises Cisco Meraki inventory into NetBox using the official [Meraki Python SDK](https://github.com/meraki/dashboard-api-python). It pulls devices, interfaces, switch stacks, VLANs, subnets, static routes and SSIDs from the Meraki Dashboard and writes them into NetBox DCIM, IPAM and Wireless. A read-only Meraki API key is all that is required.
+ 
 Sync is one-way: Meraki is the source of truth and nothing is ever written back to Meraki.
-
+ 
 ---
-
+ 
 ## What gets synced
-
+ 
 ### DCIM
-
+ 
 | NetBox object | Source / behaviour |
 |---|---|
 | `dcim.Manufacturer` | "Cisco Meraki", created once and reused |
@@ -22,9 +18,9 @@ Sync is one-way: Meraki is the source of truth and nothing is ever written back 
 | `dcim.Device` | One per Meraki serial. Matched by serial, then by name within the site. Name updates when renamed in Meraki. |
 | `dcim.Interface` | One per switch port, MX WAN/LAN port, AP radio or management port |
 | `dcim.VirtualChassis` | One per Meraki switch stack, named `{site} - {stack name}`, with master and members linked |
-
+ 
 ### Interface details (NetBox built-in fields)
-
+ 
 | Meraki data | NetBox field |
 |---|---|
 | Port name | `description` |
@@ -34,24 +30,27 @@ Sync is one-way: Meraki is the source of truth and nothing is ever written back 
 | Access / trunk mode | `mode` (`access` / `tagged`) |
 | Access VLAN | `untagged_vlan` |
 | Trunk allowed VLANs | `tagged_vlans` |
-
+ 
 VLAN assignments are only made when the matching VLAN already exists in the site's VLAN group, so they populate once IPAM has synced.
-
+ 
 ### IPAM
-
+ 
 | NetBox object | Source / behaviour |
 |---|---|
+| `ipam.VRF` | One per site, named `{site} VRF`, contains all VLANs and Prefixes for that site |
 | `ipam.VLANGroup` | One per site, named `{site} VLANs`, scoped to the site |
-| `ipam.VLAN` | MX appliance VLANs, plus Layer 3 VLANs found on switches and switch stacks |
-| `ipam.Prefix` | Each VLAN subnet, single-LAN subnet and enabled static route, linked to its VLAN where one exists |
+| `ipam.VLAN` | MX appliance VLANs, plus Layer 3 VLANs found on switches and switch stacks, scoped to the site's VRF |
+| `ipam.Prefix` | Each VLAN subnet, single-LAN subnet and enabled static route, scoped to the site's VRF and linked to its VLAN where one exists |
 | `ipam.IPRange` | Usable host range of each synced subnet (network and broadcast excluded) |
 | `ipam.IPAddress` | Device LAN IPs at the subnet's prefix length; MX WAN IPs as `/32` |
-
+ 
 Notes:
-
+ 
+- All VLANs and Prefixes are scoped to a per-site VRF named `{site name} VRF`. This allows the same subnet to exist on multiple sites without collision — e.g. `10.254.254.0/24` for IoT can be deployed on every site, with each one properly scoped to its own VRF.
 - Networks without VLANs enabled ("single LAN") get a Prefix and IP Range but no VLAN object.
 - Static routes are matched to Layer 3 interfaces on switches and switch stacks so their Prefix is linked to the correct VLAN (e.g. `172.17.205.0/24` → VLAN 205).
 - Layer 3 interfaces named `Reserved`, `Reserved1`, `Reserved 2`, etc. don't create VLANs, to avoid name collisions. Their Prefix and IP Range are still created.
+
 
 ### Wireless
 

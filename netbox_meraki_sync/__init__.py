@@ -5,7 +5,7 @@ class MerakiSyncConfig(PluginConfig):
     name = "netbox_meraki_sync"
     verbose_name = "Meraki Sync"
     description = "Synchronise Cisco Meraki network devices into NetBox"
-    version = "1.2.0"
+    version = "1.3.0"
     author = "NetBox Meraki Sync"
     base_url = "meraki"
     min_version = "4.0.0"

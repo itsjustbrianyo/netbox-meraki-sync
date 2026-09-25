@@ -152,7 +152,8 @@ class MerakiSyncer:
         ipam.VLAN object and an ipam.Prefix for its subnet.  Static routes
         also create Prefix records. VLANGroups, VLANs, Prefixes, and
         WirelessLANs all inherit the site's tenant and tags, the same way
-        synced devices do.
+        synced devices do. All IPAM objects are scoped to a per-site VRF
+        named '{site_name} VRF'.
 
         Returns a list of human-readable error strings for any VLAN/subnet
         or static route that failed, so the caller (the management command)
@@ -163,12 +164,13 @@ class MerakiSyncer:
             return errors
 
         vlan_group = self._get_vlan_group(site)
+        vrf = self._get_or_create_vrf(site)
 
         for cv in ipam_data.vlans:
             try:
                 with transaction.atomic():
-                    nb_vlan = self._sync_vlan(cv, site, vlan_group)
-                    self._sync_prefix(cv, site, nb_vlan)
+                    nb_vlan = self._sync_vlan(cv, site, vlan_group, vrf)
+                    self._sync_prefix(cv, site, nb_vlan, vrf)
                     self._sync_vlan_ip(cv, site)
                     self._sync_vlan_ip_range(cv, site)
             except Exception as exc:
@@ -181,7 +183,7 @@ class MerakiSyncer:
         for sr in ipam_data.static_routes:
             try:
                 with transaction.atomic():
-                    self._sync_static_route(sr, site)
+                    self._sync_static_route(sr, site, vrf)
             except Exception as exc:
                 log.exception(
                     "Syncer: failed to sync static route %s (%s) for site %s",
@@ -958,6 +960,21 @@ class MerakiSyncer:
         return group
 
 
+    def _get_or_create_vrf(self, site) -> "VRF":
+        """Get or create a VRF named '{site_name} VRF' for this site."""
+        from ipam.models import VRF
+        
+        if self.dry_run or site is None:
+            return None
+        
+        vrf_name = f"{site.name} VRF"
+        vrf = VRF.objects.filter(name=vrf_name).first()
+        if vrf is None:
+            vrf = VRF.objects.create(name=vrf_name)
+            log.info("Syncer: created VRF %s", vrf_name)
+        return vrf
+
+
     def _apply_site_scope(self, obj, site) -> None:
         """
         Inherit tenant + tags from the parent Site onto a VLAN or Prefix,
@@ -983,7 +1000,7 @@ class MerakiSyncer:
         if tags_to_add:
             obj.tags.add(*tags_to_add)
 
-    def _sync_vlan(self, cv: CollectedVlan, site, vlan_group):
+    def _sync_vlan(self, cv: CollectedVlan, site, vlan_group, vrf=None):
         """
         Get-or-create an ipam.VLAN for this Meraki VLAN.  Networks without
         VLANs enabled ("single LAN", vlan_id=0) don't map to a real 802.1Q
@@ -1010,27 +1027,35 @@ class MerakiSyncer:
             create_kwargs["status"] = "active"
             if vlan_group is None and self._is_settable_fk(VLAN, "site"):
                 create_kwargs["site"] = site
+            if vrf is not None and self._is_settable_fk(VLAN, "vrf"):
+                create_kwargs["vrf"] = vrf
             vlan = VLAN.objects.create(**create_kwargs)
             self.log.vlans_synced += 1
             log.info("Syncer: created VLAN %s (%s)", cv.vlan_id, cv.name)
         else:
             if not self.dry_run and hasattr(vlan, "snapshot"):
                 vlan.snapshot()  # pre-change state for changelog diff
+            changed = []
             if vlan.name != cv.name:
                 vlan.name = cv.name
-                vlan.save(update_fields=["name"])
+                changed.append("name")
+            if vrf is not None and self._is_settable_fk(VLAN, "vrf") and vlan.vrf_id != vrf.pk:
+                vlan.vrf = vrf
+                changed.append("vrf")
+            if changed and not self.dry_run:
+                vlan.save(update_fields=changed)
             self.log.vlans_synced += 1
 
         self._apply_site_scope(vlan, site)
         return vlan
 
-    def _sync_prefix(self, cv: CollectedVlan, site, nb_vlan) -> None:
+    def _sync_prefix(self, cv: CollectedVlan, site, nb_vlan, vrf=None) -> None:
         """Get-or-create an ipam.Prefix for this VLAN/LAN's subnet."""
         if not cv.subnet or self.dry_run:
             return
-        self._get_or_create_prefix(cv.subnet, site, vlan=nb_vlan)
+        self._get_or_create_prefix(cv.subnet, site, vlan=nb_vlan, vrf=vrf)
 
-    def _sync_static_route(self, sr: CollectedStaticRoute, site) -> None:
+    def _sync_static_route(self, sr: CollectedStaticRoute, site, vrf=None) -> None:
         """
         Get-or-create an ipam.Prefix (and matching ipam.IPRange) for a
         Meraki appliance static route's subnet.  If the static route
@@ -1069,7 +1094,7 @@ class MerakiSyncer:
 
             prefix = self._get_or_create_prefix(
                 sr.subnet, site, vlan=vlan, description=description,
-                is_static_route=True,
+                is_static_route=True, vrf=vrf,
             )
             if prefix is not None:
                 self.log.static_routes_synced += 1
@@ -1174,14 +1199,15 @@ class MerakiSyncer:
 
     def _get_or_create_prefix(
         self, subnet: str, site, *, vlan=None, description: str = "",
-        is_static_route: bool = False,
+        is_static_route: bool = False, vrf=None,
     ):
         """
         Shared get-or-create for ipam.Prefix, used by both VLAN/single-LAN
         subnets and static-route subnets.  Applies site tenant/tags either
         way; only overwrites description/vlan on an existing prefix when a
         static route supplies a description (VLAN subnets never blank out
-        a description a static route sync may have set).
+        a description a static route sync may have set). Prefixes are scoped
+        to a per-site VRF if vrf is provided.
         """
         from ipam.models import Prefix
 
@@ -1190,13 +1216,18 @@ class MerakiSyncer:
                 self.log.prefixes_synced += 1
             return None
 
-        prefix = Prefix.objects.filter(prefix=subnet).first()
+        lookup_kwargs = {"prefix": subnet}
+        if vrf is not None:
+            lookup_kwargs["vrf"] = vrf
+        prefix = Prefix.objects.filter(**lookup_kwargs).first()
         if prefix is None:
             create_kwargs: dict = {"prefix": subnet, "status": "active"}
             if vlan is not None:
                 create_kwargs["vlan"] = vlan
             if description:
                 create_kwargs["description"] = description
+            if vrf is not None:
+                create_kwargs["vrf"] = vrf
             if {"scope_type", "scope_id"} <= {
                 f.name for f in Prefix._meta.get_fields()
             }:

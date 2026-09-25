@@ -126,6 +126,7 @@ class CollectedStackMembership:
 class CollectedNetworkIpam:
     vlans:         list[CollectedVlan]        = field(default_factory=list)
     static_routes: list[CollectedStaticRoute] = field(default_factory=list)
+    vrf_name:      str = ""                   # Site VRF name, e.g. "Acton VRF"
 
 
 @dataclass
@@ -466,7 +467,7 @@ class MerakiCollector:
     # ------------------------------------------------------------------
 
     def collect_network_ipam(
-        self, network_id: str, switch_serials: Optional[list[str]] = None,
+        self, network_id: str, site_name: str = "", switch_serials: Optional[list[str]] = None,
     ) -> CollectedNetworkIpam:
         """
         Collect network-level IPAM information for a Meraki network: VLANs
