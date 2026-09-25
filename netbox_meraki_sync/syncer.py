@@ -278,11 +278,6 @@ class MerakiSyncer:
         — NAT-mode SSIDs and ones without VLAN tagging have vlan_id=None),
         that VLAN is looked up in this site's VLANGroup and attached, so
         NetBox reflects which subnet the SSID's clients actually land on.
-
-        If the collector populated cs.psk (only done for an SSID literally
-        named "IoT" — see collector.collect_network_wireless), it's written
-        to the WirelessLAN's auth_psk field, guarded by a field-existence
-        check in case this NetBox version doesn't have it.
         """
         from wireless.models import WirelessLAN
 
@@ -297,18 +292,24 @@ class MerakiSyncer:
         wlan = WirelessLAN.objects.filter(**lookup).first()
         auth_type = self._map_meraki_auth_mode(cs.auth_mode)
         vlan = self._find_vlan_by_id(cs.vlan_id, site) if cs.vlan_id else None
-        has_psk_field = cs.psk and self._model_has_field(WirelessLAN, "auth_psk")
 
         if wlan is None:
             create_kwargs = dict(lookup)
             create_kwargs["status"] = "active"
-            create_kwargs["description"] = f"Meraki SSID {cs.number}"
+            # Build description with SSID details
+            description_parts = [f"Meraki SSID {cs.number}"]
+            if not cs.broadcast:
+                description_parts.append("(hidden)")
+            if cs.band_steering:
+                description_parts.append("band-steering enabled")
+            if cs.client_limit > 0:
+                description_parts.append(f"max {cs.client_limit} clients")
+            create_kwargs["description"] = " ".join(description_parts)
+            
             if auth_type:
                 create_kwargs["auth_type"] = auth_type
             if vlan is not None:
                 create_kwargs["vlan"] = vlan
-            if has_psk_field:
-                create_kwargs["auth_psk"] = cs.psk
             wlan = WirelessLAN.objects.create(**create_kwargs)
             self.log.wireless_lans_synced += 1
             log.info("Syncer: created WirelessLAN %s", cs.name)
@@ -320,12 +321,23 @@ class MerakiSyncer:
             if wlan.status != "active":
                 wlan.status = "active"
                 changed.append("status")
+            
+            # Update description with current SSID details
+            description_parts = [f"Meraki SSID {cs.number}"]
+            if not cs.broadcast:
+                description_parts.append("(hidden)")
+            if cs.band_steering:
+                description_parts.append("band-steering enabled")
+            if cs.client_limit > 0:
+                description_parts.append(f"max {cs.client_limit} clients")
+            new_description = " ".join(description_parts)
+            if wlan.description != new_description:
+                wlan.description = new_description
+                changed.append("description")
+            
             if vlan is not None and wlan.vlan_id != vlan.pk:
                 wlan.vlan = vlan
                 changed.append("vlan")
-            if has_psk_field and wlan.auth_psk != cs.psk:
-                wlan.auth_psk = cs.psk
-                changed.append("auth_psk")
             if changed and not self.dry_run:
                 wlan.save(update_fields=changed)
             self.log.wireless_lans_synced += 1
@@ -542,6 +554,11 @@ class MerakiSyncer:
                     type        = iface_type,
                     enabled     = port.enabled,
                     description = port.description,
+                    speed      = self._speed_to_netbox_value(port.speed_mbps),
+                    duplex     = port.duplex or "auto",
+                    mode       = self._vlan_mode_to_netbox(port.vlan_mode, port.vlan_id),
+                    tagged_vlans = self._parse_allowed_vlans(port.allowed_vlans, device.site) if port.vlan_mode == "trunk" else [],
+                    untagged_vlan = self._get_vlan_by_id(port.vlan_id, device.site) if port.vlan_mode == "access" and port.vlan_id else None,
                 )
             self.log.interfaces_synced += 1
         else:
@@ -552,9 +569,46 @@ class MerakiSyncer:
             if iface.description != port.description:
                 iface.description = port.description
                 changed.append("description")
+            
+            # Update speed and duplex from NetBox built-in fields
+            nb_speed = self._speed_to_netbox_value(port.speed_mbps)
+            if iface.speed != nb_speed:
+                iface.speed = nb_speed
+                changed.append("speed")
+            
+            nb_duplex = port.duplex or "auto"
+            if iface.duplex != nb_duplex:
+                iface.duplex = nb_duplex
+                changed.append("duplex")
+            
+            # Update VLAN mode and tagging
+            nb_mode = self._vlan_mode_to_netbox(port.vlan_mode, port.vlan_id)
+            if str(iface.mode) != nb_mode:
+                iface.mode = nb_mode
+                changed.append("mode")
+            
+            # Update tagged/untagged VLANs
+            if port.vlan_mode == "trunk" and port.allowed_vlans:
+                tagged = self._parse_allowed_vlans(port.allowed_vlans, device.site)
+                # Compare by VLAN IDs
+                existing_tagged_ids = set(v.vid for v in iface.tagged_vlans.all()) if iface.tagged_vlans else set()
+                new_tagged_ids = set(v.vid for v in tagged) if tagged else set()
+                if existing_tagged_ids != new_tagged_ids:
+                    iface.tagged_vlans.set(tagged)
+                    changed.append("tagged_vlans")
+            elif port.vlan_mode == "access" and port.vlan_id:
+                untagged = self._get_vlan_by_id(port.vlan_id, device.site)
+                if iface.untagged_vlan != untagged:
+                    iface.untagged_vlan = untagged
+                    changed.append("untagged_vlan")
+            
             if changed and not self.dry_run:
                 iface.save(update_fields=changed)
             self.log.interfaces_synced += 1
+
+        # Write PoE configuration to custom fields
+        if not self.dry_run:
+            self._sync_interface_poe_fields(iface, port)
 
         return iface
 
@@ -679,6 +733,71 @@ class MerakiSyncer:
         if updates:
             device.custom_field_data.update(updates)
             device.save(update_fields=["custom_field_data"])
+
+        # Sync uplink configuration if this is an MX with uplinks
+        if dev.uplinks:
+            self._sync_device_uplink_fields(device, dev.uplinks)
+
+    def _sync_interface_poe_fields(self, iface, port) -> None:
+        """
+        Write PoE configuration to custom fields on the Interface record.
+        Only updates if PoE is enabled or if limits are set.
+        """
+        if self.dry_run or not iface or not port.poe_enabled:
+            return
+
+        self._ensure_interface_poe_cf()
+        if not iface.custom_field_data:
+            iface.custom_field_data = {}
+
+        changed = False
+        if port.poe_enabled:
+            if iface.custom_field_data.get("meraki_poe_enabled") != True:
+                iface.custom_field_data["meraki_poe_enabled"] = True
+                changed = True
+        
+        if port.poe_limit_w > 0:
+            if iface.custom_field_data.get("meraki_poe_limit_w") != port.poe_limit_w:
+                iface.custom_field_data["meraki_poe_limit_w"] = port.poe_limit_w
+                changed = True
+
+        if changed:
+            iface.save(update_fields=["custom_field_data"])
+            log.info(
+                "Syncer: updated PoE config for %s.%s (enabled=%s, limit=%sW)",
+                iface.device.name, iface.name, port.poe_enabled, port.poe_limit_w,
+            )
+
+
+    def _sync_device_uplink_fields(self, device, uplinks: list) -> None:
+        """
+        Write MX uplink configuration to device custom fields.  Stores uplink
+        modes and failover roles in a JSON format for easy reading.
+        """
+        if self.dry_run or not device or not uplinks:
+            return
+
+        self._ensure_device_uplink_cf()
+        if not device.custom_field_data:
+            device.custom_field_data = {}
+
+        # Build a summary of uplink config for each interface
+        uplink_summary = []
+        for ul in uplinks:
+            summary = f"{ul.interface}"
+            if ul.failover_role:
+                summary += f" ({ul.failover_role})"
+            uplink_summary.append(summary)
+
+        if uplink_summary:
+            uplink_str = ", ".join(uplink_summary)
+            if device.custom_field_data.get("meraki_uplink_config") != uplink_str:
+                device.custom_field_data["meraki_uplink_config"] = uplink_str
+                device.save(update_fields=["custom_field_data"])
+                log.info(
+                    "Syncer: updated uplink config for %s: %s",
+                    device.name, uplink_str,
+                )
 
     def _sync_virtual_chassis(self, dev: CollectedDevice, site) -> None:
         """
@@ -1284,6 +1403,56 @@ class MerakiSyncer:
         return _FAMILY_IFACE_TYPE.get(family, "other")
 
     @staticmethod
+    def _speed_to_netbox_value(speed_mbps: int) -> int | None:
+        """Convert Meraki speed in Mbps to NetBox speed value (in Mbps)."""
+        if not speed_mbps or speed_mbps == 0:
+            return None
+        return speed_mbps
+
+    @staticmethod
+    def _vlan_mode_to_netbox(vlan_mode: str, vlan_id: int) -> str:
+        """Map Meraki VLAN mode to NetBox interface mode."""
+        if vlan_mode == "access":
+            return "access"
+        elif vlan_mode == "trunk":
+            return "tagged"
+        return ""
+
+    def _get_vlan_by_id(self, vlan_id: int, site) -> object:
+        """Get a VLAN by ID scoped to the given site."""
+        if not vlan_id or vlan_id == 0:
+            return None
+        from ipam.models import VLAN, VLANGroup
+        
+        vlan_group = None
+        if site:
+            vlan_group = VLANGroup.objects.filter(
+                name__iexact=f"{site.name} VLANs"
+            ).first()
+        
+        lookup = {"vid": vlan_id}
+        if vlan_group:
+            lookup["group"] = vlan_group
+        
+        return VLAN.objects.filter(**lookup).first()
+
+    def _parse_allowed_vlans(self, allowed_vlans_str: str, site) -> list:
+        """Parse a comma-separated list of VLAN IDs and return VLAN objects."""
+        if not allowed_vlans_str:
+            return []
+        
+        vlans = []
+        for vlan_str in allowed_vlans_str.split(","):
+            vlan_str = vlan_str.strip()
+            if vlan_str.isdigit():
+                vlan_id = int(vlan_str)
+                vlan = self._get_vlan_by_id(vlan_id, site)
+                if vlan:
+                    vlans.append(vlan)
+        return vlans
+
+
+    @staticmethod
     def _ensure_device_cf(name: str, label: str) -> None:
         """Create a text custom field on dcim.device if it does not exist."""
         from django.apps import apps
@@ -1305,6 +1474,68 @@ class MerakiSyncer:
                 cf.object_types.add(device_ct)
         except Exception as exc:
             log.debug("Syncer: could not ensure custom field %s: %s", name, exc)
+
+    @staticmethod
+    def _ensure_interface_poe_cf() -> None:
+        """Create PoE custom fields on dcim.interface if they don't exist."""
+        from django.apps import apps
+        from django.contrib.contenttypes.models import ContentType
+        from extras.models import CustomField
+
+        try:
+            Interface = apps.get_model("dcim", "Interface")
+            iface_ct = ContentType.objects.get_for_model(Interface)
+
+            # PoE enabled flag
+            cf_enabled, _ = CustomField.objects.get_or_create(
+                name="meraki_poe_enabled",
+                defaults={
+                    "label": "Meraki PoE Enabled",
+                    "type": "boolean",
+                    "required": False,
+                },
+            )
+            if iface_ct not in cf_enabled.object_types.all():
+                cf_enabled.object_types.add(iface_ct)
+
+            # PoE power limit in watts
+            cf_limit, _ = CustomField.objects.get_or_create(
+                name="meraki_poe_limit_w",
+                defaults={
+                    "label": "Meraki PoE Limit (W)",
+                    "type": "integer",
+                    "required": False,
+                },
+            )
+            if iface_ct not in cf_limit.object_types.all():
+                cf_limit.object_types.add(iface_ct)
+        except Exception as exc:
+            log.debug("Syncer: could not ensure PoE custom fields: %s", exc)
+
+
+    @staticmethod
+    def _ensure_device_uplink_cf() -> None:
+        """Create MX uplink custom field on dcim.device if it doesn't exist."""
+        from django.apps import apps
+        from django.contrib.contenttypes.models import ContentType
+        from extras.models import CustomField
+
+        try:
+            Device = apps.get_model("dcim", "Device")
+            device_ct = ContentType.objects.get_for_model(Device)
+
+            cf, _ = CustomField.objects.get_or_create(
+                name="meraki_uplink_config",
+                defaults={
+                    "label": "Meraki Uplink Config",
+                    "type": "text",
+                    "required": False,
+                },
+            )
+            if device_ct not in cf.object_types.all():
+                cf.object_types.add(device_ct)
+        except Exception as exc:
+            log.debug("Syncer: could not ensure uplink custom field: %s", exc)
 
 
 # ---------------------------------------------------------------------------

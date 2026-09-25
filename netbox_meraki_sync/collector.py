@@ -45,6 +45,23 @@ class CollectedPort:
     connected:   bool = False
     speed_mbps:  int  = 0          # 0 = unknown
     is_uplink:   bool = False
+    poe_enabled: bool = False      # PoE enabled on this port
+    poe_limit_w: int  = 0          # PoE power limit in watts (0 = no limit or unknown)
+    # Switch port VLAN configuration
+    vlan_mode:   str = ""          # "access" or "trunk"
+    vlan_id:     int = 0           # Access VLAN ID (for access ports)
+    allowed_vlans: str = ""        # Comma-separated list for trunk ports
+    duplex:      str = ""          # "auto", "full", "half"
+
+
+@dataclass
+class CollectedUplink:
+    """MX appliance uplink configuration."""
+    interface:    str              # e.g., "WAN1", "WAN2", "Cellular"
+    ip_address:   str = ""         # Public/upstream IP if configured
+    gateway_ip:   str = ""         # Upstream gateway
+    failover_role: str = ""        # "primary", "secondary", or ""
+    mode:         str = ""         # "Auto", "Manual" or other config mode
 
 
 @dataclass
@@ -85,12 +102,14 @@ class CollectedStaticRoute:
 
 @dataclass
 class CollectedSsid:
-    number:      int
-    name:        str
-    enabled:     bool = True
-    auth_mode:   str = ""          # Meraki authMode: open, psk, 8021x-radius, ...
-    vlan_id:     Optional[int] = None
-    psk:         Optional[str] = None  # Pre-shared key — only collected for SSIDs named "IoT" (see collect_network_wireless)
+    number:        int
+    name:          str
+    enabled:       bool = True
+    auth_mode:     str = ""          # Meraki authMode: open, psk, 8021x-radius, ...
+    vlan_id:       Optional[int] = None
+    band_steering: bool = False      # Band steering enabled
+    broadcast:     bool = True       # SSID broadcast enabled
+    client_limit:  int = 0           # Max clients (0 = unlimited)
 
 
 @dataclass
@@ -121,6 +140,7 @@ class CollectedDevice:
     ports:       list[CollectedPort]    = field(default_factory=list)
     macs:        list[CollectedMac]     = field(default_factory=list)
     neighbours:  list[CollectedNeighbour] = field(default_factory=list)
+    uplinks:     list[CollectedUplink]  = field(default_factory=list)  # MX appliance uplink config
     stack_membership: Optional[CollectedStackMembership] = None  # Set if device is part of a Meraki switch stack
 
     @property
@@ -282,14 +302,39 @@ class MerakiCollector:
             status    = statuses.get(port_id, {})
             enabled   = raw_port.get("enabled", True)
             connected = status.get("status", "") == "Connected"
+            poe_enabled = bool(raw_port.get("poeEnabled", False))
+            # Meraki reports power limit in watts; 0 or missing = no limit/not applicable
+            poe_limit_w = int(raw_port.get("powerLimit") or 0)
+            
+            # VLAN configuration
+            vlan_mode = ""
+            vlan_id = 0
+            allowed_vlans = ""
+            if raw_port.get("type") == "access":
+                vlan_mode = "access"
+                vlan_id = int(raw_port.get("vlan") or 0)
+            elif raw_port.get("type") == "trunk":
+                vlan_mode = "trunk"
+                # allowedVlans is a list of VLAN IDs or ranges like [1, "2-10"]
+                vlans_list = raw_port.get("allowedVlans", [])
+                allowed_vlans = ",".join(str(v) for v in vlans_list) if vlans_list else ""
+            
+            # Duplex from port status
+            duplex = status.get("duplex", "").lower() or ""  # "full", "half", "auto"
 
             cp = CollectedPort(
-                port_id     = port_id,
-                name        = port_id,
-                description = raw_port.get("name") or "",
-                enabled     = enabled,
-                connected   = connected,
-                speed_mbps  = _parse_speed_mbps(status.get("speed", "")),
+                port_id        = port_id,
+                name           = port_id,
+                description    = raw_port.get("name") or "",
+                enabled        = enabled,
+                connected      = connected,
+                speed_mbps     = _parse_speed_mbps(status.get("speed", "")),
+                poe_enabled    = poe_enabled,
+                poe_limit_w    = poe_limit_w,
+                vlan_mode      = vlan_mode,
+                vlan_id        = vlan_id,
+                allowed_vlans  = allowed_vlans,
+                duplex         = duplex,
             )
             dev.ports.append(cp)
 
@@ -336,7 +381,7 @@ class MerakiCollector:
                     ))
 
     def _collect_appliance(self, dev: CollectedDevice) -> None:
-        """MX appliance — WAN + LAN ports."""
+        """MX appliance — WAN + LAN ports and uplink configuration."""
         if dev.wan1_ip:
             dev.ports.append(CollectedPort(
                 port_id="wan1", name="WAN 1",
@@ -359,16 +404,57 @@ class MerakiCollector:
             dev.ports.append(CollectedPort(
                 port_id="mgmt", name="Management", enabled=True,
             ))
+        
+        # Collect MX uplink configuration (failover settings, etc.)
+        self._collect_uplink_config(dev)
+
+    def _collect_uplink_config(self, dev: CollectedDevice) -> None:
+        """Collect MX uplink failover/load-balancing configuration."""
+        raw_uplinks = self._get_network_appliance_uplink_statuses(dev.serial)
+        for raw_uplink in raw_uplinks:
+            interface = raw_uplink.get("interface", "")
+            if not interface:
+                continue
+            
+            uplink = CollectedUplink(
+                interface     = interface,
+                ip_address    = raw_uplink.get("ip") or "",
+                gateway_ip    = raw_uplink.get("gateway") or "",
+                failover_role = raw_uplink.get("role") or "",
+                mode          = raw_uplink.get("mode") or "",
+            )
+            dev.uplinks.append(uplink)
 
     def _collect_ap(self, dev: CollectedDevice, raw: dict) -> None:
-        """MR access point — one radio interface."""
-        dev.ports.append(CollectedPort(
-            port_id="radio0",
-            name="Radio 0",
-            description=raw.get("model", ""),
-            enabled=True,
-            connected=True,
-        ))
+        """MR access point — radio interfaces with wireless config."""
+        # Collect radio status/config for each radio on this AP
+        radio_status = self._get_device_wireless_status(dev.serial)
+        
+        # APs typically have radio0 and sometimes radio1 (dual-band)
+        # If we have radio_status, use it; otherwise create a default radio0
+        if radio_status:
+            for radio_data in radio_status.get("radios", []):
+                radio_num = radio_data.get("index", 0)
+                port = CollectedPort(
+                    port_id      = f"radio{radio_num}",
+                    name         = f"Radio {radio_num}",
+                    description  = raw.get("model", ""),
+                    enabled      = True,
+                    connected    = True,
+                    radio_band   = radio_data.get("band", ""),      # "2.4", "5", "6"
+                    radio_channel = str(radio_data.get("channel", "")),  # e.g., "1", "36"
+                    radio_power  = int(radio_data.get("txPower") or 0),  # dBm
+                )
+                dev.ports.append(port)
+        else:
+            # Fallback if wireless status unavailable
+            dev.ports.append(CollectedPort(
+                port_id="radio0",
+                name="Radio 0",
+                description=raw.get("model", ""),
+                enabled=True,
+                connected=True,
+            ))
 
     # ------------------------------------------------------------------
     # IPAM collection (network-level, not per-device)
@@ -583,6 +669,38 @@ class MerakiCollector:
             )
             return []
 
+    def _get_network_appliance_uplink_statuses(self, network_id: str) -> list[dict]:
+        """
+        Get uplink status/config for an MX appliance — includes failover role,
+        IP configuration, uplink mode.  Returns empty list on error or for
+        non-MX devices or if the method is not available in this SDK version.
+        """
+        try:
+            return self.dashboard.appliance.getNetworkApplianceUplinkStatuses(
+                networkId=network_id
+            )
+        except (meraki.exceptions.APIError, AttributeError) as exc:
+            log.debug(
+                "Meraki: getNetworkApplianceUplinkStatuses failed for %s: %s",
+                network_id, exc,
+            )
+            return []
+
+    def _get_device_wireless_status(self, serial: str) -> Optional[dict]:
+        """
+        Get wireless radio status for an AP — includes band, channel, TX power,
+        and other radio configuration. Returns None on error or for non-AP
+        devices or if the method is not available in this SDK version.
+        """
+        try:
+            return self.dashboard.wireless.getDeviceWirelessStatus(serial=serial)
+        except (meraki.exceptions.APIError, AttributeError) as exc:
+            log.debug(
+                "Meraki: getDeviceWirelessStatus failed for %s: %s",
+                serial, exc,
+            )
+            return None
+
     def _get_device_switch_routing_interfaces(self, serial: str) -> list[dict]:
         """
         Get a standalone switch's Layer 3 routing interfaces (VLAN
@@ -674,15 +792,8 @@ class MerakiCollector:
         "NAT mode"`) or without VLAN tagging enabled get vlan_id=None,
         which the syncer leaves unset on the WirelessLAN in NetBox.
 
-        PSKs are intentionally never collected for most SSIDs — auth mode
-        is recorded, but no secrets are pulled into NetBox.  The one
-        exception: an SSID literally named "IoT" (case-insensitive) has its
-        pre-shared key fetched via a dedicated getNetworkWirelessSsid call
-        (the list endpoint used for everything else doesn't reliably
-        include it) and stored on CollectedSsid.psk, which the syncer
-        writes to the WirelessLAN's auth_psk field.  This is a deliberate,
-        narrowly-scoped exception — do not extend it to other SSIDs without
-        an explicit request, since it means a secret lands in NetBox.
+        Auth mode is recorded but PSKs are not collected — store secrets
+        separately outside of NetBox.
         """
         raw_ssids = self._get_network_wireless_ssids(network_id)
         results = []
@@ -691,18 +802,15 @@ class MerakiCollector:
             if not raw.get("enabled") or not name or name.startswith("Unconfigured SSID"):
                 continue
 
-            psk = None
-            if name.lower() == "iot":
-                detail = self._get_network_wireless_ssid(network_id, raw.get("number"))
-                psk = (detail or raw).get("psk") or None
-
             results.append(CollectedSsid(
-                number    = int(raw.get("number", 0)),
-                name      = name,
-                enabled   = True,
-                auth_mode = raw.get("authMode") or "",
-                vlan_id   = self._extract_ssid_vlan_id(raw),
-                psk       = psk,
+                number         = int(raw.get("number", 0)),
+                name           = name,
+                enabled        = True,
+                auth_mode      = raw.get("authMode") or "",
+                vlan_id        = self._extract_ssid_vlan_id(raw),
+                band_steering  = raw.get("bandSteeringEnabled", False),
+                broadcast      = raw.get("ssidAdminAccessible", True),  # true = SSID broadcast enabled
+                client_limit   = raw.get("clientLimitPerAccessPoint", 0),  # 0 = no limit
             ))
 
         log.info(
@@ -753,29 +861,6 @@ class MerakiCollector:
                 network_id, exc,
             )
             return []
-
-    def _get_network_wireless_ssid(
-        self, network_id: str, number,
-    ) -> Optional[dict]:
-        """
-        Fetch a single SSID's full detail, used only to recover the
-        pre-shared key for the "IoT" SSID exception in
-        collect_network_wireless — the list endpoint doesn't reliably
-        include `psk`.  Returns None on any failure so the caller falls
-        back to whatever the list endpoint already returned.
-        """
-        if number is None:
-            return None
-        try:
-            return self.dashboard.wireless.getNetworkWirelessSsid(
-                networkId=network_id, number=number,
-            )
-        except meraki.exceptions.APIError as exc:
-            log.debug(
-                "Meraki: getNetworkWirelessSsid failed for %s/%s: %s",
-                network_id, number, exc,
-            )
-            return None
 
     def _get_device_management_interface(self, serial: str) -> dict:
         try:
