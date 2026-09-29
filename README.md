@@ -1,15 +1,15 @@
 # netbox-meraki-sync
- 
+
 A NetBox 4.x plugin that synchronises Cisco Meraki inventory into NetBox using the official [Meraki Python SDK](https://github.com/meraki/dashboard-api-python). It pulls devices, interfaces, switch stacks, VLANs, subnets, static routes and SSIDs from the Meraki Dashboard and writes them into NetBox DCIM, IPAM and Wireless. A read-only Meraki API key is all that is required.
- 
+
 Sync is one-way: Meraki is the source of truth and nothing is ever written back to Meraki.
- 
+
 ---
- 
+
 ## What gets synced
- 
+
 ### DCIM
- 
+
 | NetBox object | Source / behaviour |
 |---|---|
 | `dcim.Manufacturer` | "Cisco Meraki", created once and reused |
@@ -18,9 +18,9 @@ Sync is one-way: Meraki is the source of truth and nothing is ever written back 
 | `dcim.Device` | One per Meraki serial. Matched by serial, then by name within the site. Name updates when renamed in Meraki. |
 | `dcim.Interface` | One per switch port, MX WAN/LAN port, AP radio or management port |
 | `dcim.VirtualChassis` | One per Meraki switch stack, named `{site} - {stack name}`, with master and members linked |
- 
+
 ### Interface details (NetBox built-in fields)
- 
+
 | Meraki data | NetBox field |
 |---|---|
 | Port name | `description` |
@@ -30,11 +30,11 @@ Sync is one-way: Meraki is the source of truth and nothing is ever written back 
 | Access / trunk mode | `mode` (`access` / `tagged`) |
 | Access VLAN | `untagged_vlan` |
 | Trunk allowed VLANs | `tagged_vlans` |
- 
+
 VLAN assignments are only made when the matching VLAN already exists in the site's VLAN group, so they populate once IPAM has synced.
- 
+
 ### IPAM
- 
+
 | NetBox object | Source / behaviour |
 |---|---|
 | `ipam.VRF` | One per site, named `{site} VRF`, contains all VLANs and Prefixes for that site |
@@ -43,14 +43,13 @@ VLAN assignments are only made when the matching VLAN already exists in the site
 | `ipam.Prefix` | Each VLAN subnet, single-LAN subnet and enabled static route, scoped to the site's VRF and linked to its VLAN where one exists |
 | `ipam.IPRange` | Usable host range of each synced subnet (network and broadcast excluded) |
 | `ipam.IPAddress` | Device LAN IPs at the subnet's prefix length; MX WAN IPs as `/32` |
- 
+
 Notes:
- 
+
 - All VLANs and Prefixes are scoped to a per-site VRF named `{site name} VRF`. This allows the same subnet to exist on multiple sites without collision — e.g. `10.254.254.0/24` for IoT can be deployed on every site, with each one properly scoped to its own VRF.
 - Networks without VLANs enabled ("single LAN") get a Prefix and IP Range but no VLAN object.
 - Static routes are matched to Layer 3 interfaces on switches and switch stacks so their Prefix is linked to the correct VLAN (e.g. `172.17.205.0/24` → VLAN 205).
 - Layer 3 interfaces named `Reserved`, `Reserved1`, `Reserved 2`, etc. don't create VLANs, to avoid name collisions. Their Prefix and IP Range are still created.
-
 
 ### Wireless
 
@@ -188,9 +187,42 @@ PLUGINS_CONFIG = {
 
         # NetBox user that changelog entries are attributed to.
         "changelog_username": "meraki-sync",
+
+        # Enrich newly-created DeviceTypes with specs and elevation images
+        # from the NetBox Community Device Type Library
+        # (https://github.com/netbox-community/devicetype-library).
+        # Requires outbound HTTPS to api.github.com and
+        # raw.githubusercontent.com. Off by default.
+        "enable_devicetype_library": False,
+
+        # How many days to cache the library's file listing before
+        # re-fetching it from the GitHub API (rate-limited to ~60
+        # unauthenticated requests/hour).
+        "devicetype_library_cache_days": 7,
     }
 }
 ```
+
+### Device Type Library enrichment
+
+With `enable_devicetype_library` set, the first time the plugin creates a DeviceType for a given Meraki model (e.g. the first `MS220-8P` it ever sees), it looks up that model in the [NetBox Community Device Type Library](https://github.com/netbox-community/devicetype-library) and fills in:
+
+- Rack height, weight, airflow direction, part number, and comments
+- Front and rear elevation images, where the library has them
+
+This only runs once per model, on creation — it never overwrites a DeviceType you've since edited by hand, and it does **not** import the library's template interfaces (the plugin already creates real interfaces from live Meraki port data, so template interfaces would just be duplicates to clean up).
+
+The repo's file listing is cached to disk at `/tmp/netbox-meraki-sync-cache/` for `devicetype_library_cache_days` (default 7) to stay well under GitHub's unauthenticated rate limit. If a model isn't found in the library, or the request fails, the plugin falls back to a bare DeviceType as before — this never blocks or fails the sync.
+
+**Enrichment only runs when a DeviceType is created**, so turning `enable_devicetype_library` on doesn't touch any DeviceType that already exists — those were created before the feature ran, or during a sync where the lookup failed. To fill those in without a full sync:
+
+```bash
+python3 manage.py sync_meraki --backfill-device-types
+```
+
+or, from the NetBox UI, run the **Meraki Sync** script with its **Backfill device types** box ticked instead of running a normal sync.
+
+This only fills DeviceTypes that have no data yet — no rack height set, no image, and no comments — so it's safe to run repeatedly and won't touch anything you've since edited by hand or that already got enriched. NetBox won't let you delete a DeviceType while Devices reference it, so this backfill (rather than delete-and-recreate) is the way to enrich existing ones.
 
 ### 4. Run migrations
 
@@ -234,7 +266,7 @@ While you're on the Site, set its **Tenant**, **Tags** and **latitude/longitude*
 
 ---
 
-## Running a sync
+## Running a sync from the command line
 
 ```bash
 cd /opt/netbox/netbox
@@ -260,50 +292,67 @@ python3 manage.py sync_meraki --user jsmith
 | `--list-networks` | List networks visible to the API key and exit |
 
 ---
- 
+
 ## Running and scheduling from the NetBox UI
- 
-The repository includes a NetBox custom script, `meraki_helper_script.py`, that runs the same sync from the web interface. It runs on NetBox's background worker, so it can be triggered with a button or scheduled to repeat. No cron needed.
- 
+
+The repository includes a NetBox custom script, `scripts/meraki_sync_script.py`, that runs the same sync from the web interface. It runs on NetBox's background worker, so it can be triggered with a button or scheduled to repeat. No cron needed.
+
 ### Install the script
- 
+
 1. Go to **Customization → Scripts → Add**.
-2. Upload `meraki_helper_script.py`.
+2. Upload `scripts/meraki_sync_script.py`.
 3. It appears in the scripts list as **Meraki Sync**.
+
 Uploading and running scripts requires admin rights or the matching script permissions. The NetBox background worker must be running:
- 
+
 ```bash
 systemctl status netbox-rq
 ```
- 
+
 ### Run on demand
- 
+
 Open **Meraki Sync** and set:
- 
+
 | Field | Description |
 |---|---|
 | **Site** | Sync one site. Leave blank to sync every site with a Meraki Network ID. |
 | **Dry run** | Collect from Meraki without writing anything to NetBox. |
 | **Commit changes** | Must be **ticked**. If it is off, NetBox rolls back everything the script writes, and the log shows a warning. |
- 
+
 Click **Run Script**. The sync output appears in the job log, and every change is recorded in the changelog, attributed to the user who ran it.
- 
+
 ### Schedule recurring syncs
- 
+
 On the same run page, under **Script Execution Parameters**:
- 
+
 | Field | Example |
 |---|---|
 | **Schedule at** | First run time, e.g. tonight at 02:00 |
 | **Recurs every** | Interval in minutes: `240` for every 4 hours, `1440` for daily |
- 
+
 Make sure **Commit changes** is ticked before scheduling. A scheduled job keeps the settings it was created with, so to change them, delete the job and schedule it again.
- 
+
 Scheduled and past runs are listed under **Operations → Jobs**, where you can view each run's log or delete the schedule. Scheduled runs are attributed in the changelog to the user who created the schedule.
- 
+
 The script allows up to one hour per run, so a full sync across many sites isn't cut off by NetBox's default job timeout.
 
 ---
+
+## Viewing sync results
+
+**Plugins → Meraki Sync → Sync Logs** shows the history of sync runs with per-network counts of devices, interfaces, IPs, VLANs, prefixes, static routes and SSIDs.
+
+Sync logs are also available through the REST API:
+
+```
+GET /api/plugins/meraki/sync-logs/
+GET /api/plugins/meraki/sync-logs/<id>/
+```
+
+For object-level detail of what changed, use the NetBox changelog (see [Change logging](#change-logging)).
+
+---
+
 
 ## Meraki API key permissions
 
@@ -350,4 +399,9 @@ netbox_meraki_sync/
 ├── tables/
 ├── views/
 └── templates/netbox_meraki_sync/
+
+scripts/
+└── meraki_sync_script.py    NetBox custom script for UI runs and scheduling
 ```
+Note: The majorit of this script was coded with the help of Claude.
+

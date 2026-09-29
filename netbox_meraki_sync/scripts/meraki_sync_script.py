@@ -34,8 +34,32 @@ class MerakiSync(Script):
         default=False,
         description="Collect from Meraki without writing anything to NetBox",
     )
+    backfill_device_types = BooleanVar(
+        default=False,
+        description=(
+            "Instead of syncing, enrich existing Meraki device types from the "
+            "NetBox Community Device Type Library and exit. Only fills device "
+            "types with no data yet (no rack height, image, or comments) — "
+            "never overwrites anything. Requires enable_devicetype_library."
+        ),
+    )
 
     def run(self, data, commit):
+        if data["backfill_device_types"]:
+            out, err = io.StringIO(), io.StringIO()
+            try:
+                call_command("sync_meraki", "--backfill-device-types", stdout=out, stderr=err)
+            except (CommandError, SystemExit) as exc:
+                self.log_failure(f"Backfill failed: {exc}")
+                return
+            for line in out.getvalue().splitlines():
+                if line.strip():
+                    self.log_info(line)
+            for line in err.getvalue().splitlines():
+                if line.strip():
+                    self.log_warning(line)
+            return
+
         options = {"dry_run": data["dry_run"]}
 
         if not commit:

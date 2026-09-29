@@ -92,17 +92,24 @@ class MerakiSyncer:
         dry_run: bool = False,
         sync_ips: bool = False,
         default_role_slug: str = "network",
+        enable_devicetype_library: bool = False,
+        devicetype_library_cache_days: int = 7,
     ) -> None:
         self.log              = sync_log
         self.dry_run          = dry_run
         self.sync_ips         = sync_ips
         self.default_role_slug = default_role_slug
+        self.enable_devicetype_library = enable_devicetype_library
 
         # Cached lookups populated on first use
         self._manufacturer   = None
         self._meraki_tag     = None
         self._role_cache: dict[str, object]        = {}
         self._device_type_cache: dict[str, object] = {}
+        self._devicetype_library = None
+        if enable_devicetype_library:
+            from .devicetype_library import DeviceTypeLibrary
+            self._devicetype_library = DeviceTypeLibrary(cache_days=devicetype_library_cache_days)
 
     # ------------------------------------------------------------------
     # Public API
@@ -459,10 +466,14 @@ class MerakiSyncer:
                 device.longitude = site_lon
                 changed.append("longitude")
             
-            if changed and not self.dry_run:
-                device.save(update_fields=changed)
-            self.log.devices_updated += 1
-            log.debug("Syncer: updated device %s (%s)", dev.name, dev.serial)
+            if changed:
+                if not self.dry_run:
+                    device.save(update_fields=changed)
+                self.log.devices_updated += 1
+                log.debug(
+                    "Syncer: updated device %s (%s) — %s",
+                    dev.name, dev.serial, ", ".join(changed),
+                )
 
         # Apply default "meraki" tag as well as all tags assigned to the parent Site
         if device and not self.dry_run:
@@ -626,20 +637,32 @@ class MerakiSyncer:
             if changed and not self.dry_run:
                 iface.save(update_fields=changed)
             
-            # Update tagged VLANs (M2M field) separately
-            if not self.dry_run:
-                if port.vlan_mode == "trunk" and port.allowed_vlans:
-                    tagged = self._parse_allowed_vlans(port.allowed_vlans, device.site)
-                    # Compare by VLAN IDs
-                    existing_tagged_ids = set(v.vid for v in iface.tagged_vlans.all()) if iface.tagged_vlans else set()
-                    new_tagged_ids = set(v.vid for v in tagged) if tagged else set()
-                    if existing_tagged_ids != new_tagged_ids:
+            # Update tagged VLANs (M2M field) separately — tracked outside
+            # `changed` since it's a separate write path, but still counts
+            # toward whether this interface actually changed.
+            tagged_vlans_changed = False
+            if port.vlan_mode == "trunk" and port.allowed_vlans:
+                tagged = self._parse_allowed_vlans(port.allowed_vlans, device.site)
+                # Compare by VLAN IDs
+                existing_tagged_ids = set(v.vid for v in iface.tagged_vlans.all()) if iface.tagged_vlans else set()
+                new_tagged_ids = set(v.vid for v in tagged) if tagged else set()
+                if existing_tagged_ids != new_tagged_ids:
+                    tagged_vlans_changed = True
+                    if not self.dry_run:
                         iface.tagged_vlans.set(tagged)
-                elif iface.tagged_vlans.exists():
-                    # Clear tagged VLANs if no longer trunk mode
+            elif iface.tagged_vlans.exists():
+                # Clear tagged VLANs if no longer trunk mode
+                tagged_vlans_changed = True
+                if not self.dry_run:
                     iface.tagged_vlans.clear()
             
-            self.log.interfaces_synced += 1
+            if changed or tagged_vlans_changed:
+                self.log.interfaces_synced += 1
+                log.debug(
+                    "Syncer: updated interface %s on %s — %s",
+                    port.name, device.name,
+                    ", ".join(changed + (["tagged_vlans"] if tagged_vlans_changed else [])),
+                )
 
         # Write PoE configuration to custom fields
         if not self.dry_run:
@@ -1042,9 +1065,10 @@ class MerakiSyncer:
             if vrf is not None and self._is_settable_fk(VLAN, "vrf") and vlan.vrf_id != vrf.pk:
                 vlan.vrf = vrf
                 changed.append("vrf")
-            if changed and not self.dry_run:
-                vlan.save(update_fields=changed)
-            self.log.vlans_synced += 1
+            if changed:
+                if not self.dry_run:
+                    vlan.save(update_fields=changed)
+                self.log.vlans_synced += 1
 
         self._apply_site_scope(vlan, site)
         return vlan
@@ -1253,10 +1277,11 @@ class MerakiSyncer:
             if description and prefix.description != description:
                 prefix.description = description
                 changed.append("description")
-            if changed and not self.dry_run:
-                prefix.save(update_fields=changed)
-            if not is_static_route:
-                self.log.prefixes_synced += 1
+            if changed:
+                if not self.dry_run:
+                    prefix.save(update_fields=changed)
+                if not is_static_route:
+                    self.log.prefixes_synced += 1
 
         self._apply_site_scope(prefix, site)
         return prefix
@@ -1421,13 +1446,107 @@ class MerakiSyncer:
     def _get_device_type(self, model: str, manufacturer):
         if model not in self._device_type_cache:
             from dcim.models import DeviceType
-            dt, _ = DeviceType.objects.get_or_create(
+            dt, created = DeviceType.objects.get_or_create(
                 manufacturer=manufacturer,
                 model=model,
                 defaults={"slug": slugify(model)},
             )
+            if created and self._devicetype_library is not None:
+                self._enrich_device_type(dt, model)
             self._device_type_cache[model] = dt
         return self._device_type_cache[model]
+
+    def backfill_device_types(self) -> tuple[int, int]:
+        """
+        Enrich every existing Meraki DeviceType that hasn't been
+        enriched yet — for DeviceTypes created before
+        enable_devicetype_library was turned on, or during a run where
+        the lookup failed (e.g. GitHub unreachable).
+
+        A DeviceType only counts as "already enriched" if it has a
+        u_height other than NetBox's default of 1 OR a front/rear
+        image OR non-empty comments — so this is safe to run
+        repeatedly and won't re-fetch or overwrite ones that already
+        got their data, but will retry ones that came back empty last
+        time. It never touches a field you've since edited by hand,
+        because it only fills in u_height/weight/etc. and only adds an
+        image where none exists — it doesn't diff or overwrite existing
+        values.
+
+        Returns (enriched_count, skipped_count).
+        """
+        from dcim.models import DeviceType
+
+        if self._devicetype_library is None:
+            log.warning("Syncer: backfill_device_types called without enable_devicetype_library set.")
+            return (0, 0)
+
+        manufacturer = self._get_manufacturer()
+        enriched, skipped = 0, 0
+        for dt in DeviceType.objects.filter(manufacturer=manufacturer):
+            already_enriched = (
+                dt.u_height != 1
+                or bool(dt.front_image)
+                or bool(dt.rear_image)
+                or bool(dt.comments)
+            )
+            if already_enriched:
+                skipped += 1
+                continue
+            self._enrich_device_type(dt, dt.model)
+            dt.refresh_from_db()
+            if dt.u_height != 1 or dt.front_image or dt.rear_image or dt.comments:
+                enriched += 1
+            else:
+                skipped += 1
+        return (enriched, skipped)
+
+    def _enrich_device_type(self, device_type, model: str) -> None:
+        """
+        Fill in u_height, weight, airflow, part_number, comments, and
+        front/rear elevation images from the NetBox Community Device
+        Type Library, for a DeviceType this sync just created. Only
+        runs once per model (on creation), so hand edits made in NetBox
+        afterward are never overwritten by a later sync.
+        """
+        try:
+            definition = self._devicetype_library.find_definition(model)
+        except Exception as exc:
+            log.warning("Device Type Library: lookup failed for %s: %s", model, exc)
+            return
+        if not definition:
+            log.debug("Device Type Library: no match found for model %s", model)
+            return
+
+        fields = []
+        for field, key in (
+            ("u_height", "u_height"),
+            ("is_full_depth", "is_full_depth"),
+            ("airflow", "airflow"),
+            ("weight", "weight"),
+            ("weight_unit", "weight_unit"),
+            ("part_number", "part_number"),
+            ("comments", "comments"),
+        ):
+            value = definition.get(key)
+            if value is not None:
+                setattr(device_type, field, value)
+                fields.append(field)
+
+        for face, attr in (("front", "front_image"), ("rear", "rear_image")):
+            image = self._devicetype_library.fetch_image(definition, face)
+            if image:
+                filename, content = image
+                from django.core.files.base import ContentFile
+                getattr(device_type, attr).save(filename, ContentFile(content), save=False)
+                fields.append(attr)
+
+        if fields:
+            device_type.save()
+            log.info(
+                "Syncer: enriched DeviceType %s from devicetype-library (%s)",
+                model, ", ".join(fields),
+            )
 
     def _get_role(self, family: str):
         """

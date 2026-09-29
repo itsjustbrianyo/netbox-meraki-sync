@@ -116,8 +116,47 @@ class Command(BaseCommand):
                 "and exit.  Useful for finding network IDs to map to sites."
             ),
         )
+        parser.add_argument(
+            "--backfill-device-types",
+            action="store_true",
+            help=(
+                "Enrich existing Meraki DeviceTypes from the NetBox Community "
+                "Device Type Library and exit, without running a sync. Only "
+                "fills DeviceTypes that don't already have data (rack height, "
+                "an image, or comments) — never overwrites anything. Requires "
+                "enable_devicetype_library to be set in PLUGINS_CONFIG."
+            ),
+        )
+
+    def _handle_backfill_device_types(self):
+        from ...syncer import MerakiSyncer
+        from ...models.sync_log import SyncLog
+
+        if not _plugin_setting("enable_devicetype_library", False):
+            self.stderr.write(self.style.ERROR(
+                "enable_devicetype_library is not set in PLUGINS_CONFIG. "
+                "Enable it before running --backfill-device-types."
+            ))
+            sys.exit(1)
+
+        syncer = MerakiSyncer(
+            sync_log=SyncLog(),
+            enable_devicetype_library=True,
+            devicetype_library_cache_days=_plugin_setting(
+                "devicetype_library_cache_days", 7,
+            ),
+        )
+        self.stdout.write("Checking existing Meraki device types against the Device Type Library...")
+        enriched, skipped = syncer.backfill_device_types()
+        self.stdout.write(self.style.SUCCESS(
+            f"Done — {enriched} device type(s) enriched, {skipped} already had data or no match found."
+        ))
 
     def handle(self, *args, **options):
+        if options["backfill_device_types"]:
+            self._handle_backfill_device_types()
+            return
+
         api_key = _get_api_key()
         if not api_key:
             self.stderr.write(self.style.ERROR(
@@ -226,6 +265,12 @@ class Command(BaseCommand):
                     dry_run           = dry_run,
                     sync_ips          = sync_ips,
                     default_role_slug = role_slug,
+                    enable_devicetype_library = _plugin_setting(
+                        "enable_devicetype_library", False,
+                    ),
+                    devicetype_library_cache_days = _plugin_setting(
+                        "devicetype_library_cache_days", 7,
+                    ),
                 )
 
                 try:
