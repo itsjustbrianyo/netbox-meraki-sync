@@ -131,7 +131,7 @@ Because the sync goes through NetBox's event system, any webhooks or event rules
 
 ## Requirements
 
-- NetBox 4.0 or later
+- NetBox 4.1 or later
 - Python 3.10+
 - `meraki` Python SDK (installed automatically)
 - A Cisco Meraki Dashboard API key with read-only access
@@ -220,7 +220,7 @@ The repo's file listing is cached to disk at `/tmp/netbox-meraki-sync-cache/` fo
 python3 manage.py sync_meraki --backfill-device-types
 ```
 
-or, from the NetBox UI, run the **Meraki Sync** script with its **Backfill device types** box ticked instead of running a normal sync.
+or, from the NetBox UI, tick **Backfill device types** on the **Run Sync** page instead of running a normal sync.
 
 This only fills DeviceTypes that have no data yet — no rack height set, no image, and no comments — so it's safe to run repeatedly and won't touch anything you've since edited by hand or that already got enriched. NetBox won't let you delete a DeviceType while Devices reference it, so this backfill (rather than delete-and-recreate) is the way to enrich existing ones.
 
@@ -295,46 +295,41 @@ python3 manage.py sync_meraki --user jsmith
 
 ## Running and scheduling from the NetBox UI
 
-The repository includes a NetBox custom script, `scripts/meraki_sync_script.py`, that runs the same sync from the web interface. It runs on NetBox's background worker, so it can be triggered with a button or scheduled to repeat. No cron needed.
+The plugin has its own **Run Sync** page (**Plugins → Meraki Sync → Run Sync**, or the **Run sync** button on the Sync Logs page). It queues a NetBox background job, so a sync can be started with a button or scheduled to repeat. No cron and no uploaded script needed. It uses NetBox's own job system, so it keeps working when core custom scripts are removed in NetBox 5.0.
 
-### Install the script
-
-1. Go to **Customization → Scripts → Add**.
-2. Upload `scripts/meraki_sync_script.py`.
-3. It appears in the scripts list as **Meraki Sync**.
-
-Uploading and running scripts requires admin rights or the matching script permissions. The NetBox background worker must be running:
+The NetBox background worker must be running:
 
 ```bash
 systemctl status netbox-rq
 ```
 
-### Run on demand
+### Permissions
 
-Open **Meraki Sync** and set:
+Running or scheduling a sync requires the `netbox_meraki_sync | sync log | Can add sync log` object permission (superusers always have it). Grant it to a group under **Admin → Permissions** to let non-admins run syncs. The Run Sync menu item and button are hidden without it.
+
+### Run on demand
 
 | Field | Description |
 |---|---|
 | **Site** | Sync one site. Leave blank to sync every site with a Meraki Network ID. |
 | **Dry run** | Collect from Meraki without writing anything to NetBox. |
-| **Commit changes** | Must be **ticked**. If it is off, NetBox rolls back everything the script writes, and the log shows a warning. |
+| **Backfill device types** | Run the Device Type Library backfill instead of a sync. |
+| **Schedule at / Recurs every** | Leave blank to run now. |
 
-Click **Run Script**. The sync output appears in the job log, and every change is recorded in the changelog, attributed to the user who ran it.
+Click **Run / Schedule**. You are taken to the job, whose log shows the sync output. Changes are recorded in the changelog, attributed to the user who ran it.
 
 ### Schedule recurring syncs
 
-On the same run page, under **Script Execution Parameters**:
-
 | Field | Example |
 |---|---|
-| **Schedule at** | First run time, e.g. tonight at 02:00 |
+| **Schedule at** | First run time, e.g. tonight at 02:00 (blank with an interval = start now) |
 | **Recurs every** | Interval in minutes: `240` for every 4 hours, `1440` for daily |
 
-Make sure **Commit changes** is ticked before scheduling. A scheduled job keeps the settings it was created with, so to change them, delete the job and schedule it again.
+Scheduled jobs are listed on the Run Sync page and under **Operations → Jobs**. A schedule keeps the settings it was created with; to change it, delete the job and schedule it again. Scheduled runs are attributed to the user who created the schedule. If a run is still going when the next one fires, the new one is skipped. Each run may take up to one hour.
 
-Scheduled and past runs are listed under **Operations → Jobs**, where you can view each run's log or delete the schedule. Scheduled runs are attributed in the changelog to the user who created the schedule.
+### Migrating from the old custom script
 
-The script allows up to one hour per run, so a full sync across many sites isn't cut off by NetBox's default job timeout.
+If you previously uploaded `meraki_sync_script.py` under **Customization → Scripts**, delete that script (and its scheduled jobs under **Operations → Jobs**), then create the schedule again from the Run Sync page.
 
 ---
 
@@ -353,6 +348,21 @@ For object-level detail of what changed, use the NetBox changelog (see [Change l
 
 ---
 
+## Starting fresh
+
+`clear_meraki_netbox_standalone.py` removes everything the plugin has created so you can re-sync from a clean slate. It runs from any computer with Python and only needs the NetBox URL and an API token:
+
+```bash
+# Preview what would be deleted
+python3 clear_meraki_netbox_standalone.py --url https://netbox.example.com --token YOUR_TOKEN --dry-run
+
+# Delete
+python3 clear_meraki_netbox_standalone.py --url https://netbox.example.com --token YOUR_TOKEN
+```
+
+It deletes Meraki-tagged Devices, WirelessLANs, VLANs, Prefixes and IP Ranges, plus Virtual Chassis, `* VLANs` / `* WLANs` groups and sync logs. Back up your database and always run `--dry-run` first. VLAN/WLAN groups are matched by name and Virtual Chassis are not filtered by tag, so review the dry-run output carefully if you have any that weren't created by this plugin.
+
+---
 
 ## Meraki API key permissions
 
@@ -389,6 +399,8 @@ netbox_meraki_sync/
 ├── filtersets.py
 ├── navigation.py
 ├── urls.py
+├── sync_runner.py           Shared sync orchestration (CLI and job)
+├── jobs.py                  Background job for the Run Sync page
 ├── management/commands/
 │   └── sync_meraki.py       CLI entry point
 ├── models/
@@ -399,9 +411,4 @@ netbox_meraki_sync/
 ├── tables/
 ├── views/
 └── templates/netbox_meraki_sync/
-
-scripts/
-└── meraki_sync_script.py    NetBox custom script for UI runs and scheduling
 ```
-Note: The majorit of this script was coded with the help of Claude.
-

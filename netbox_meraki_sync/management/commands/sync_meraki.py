@@ -38,46 +38,44 @@ environment variable):
 
 Scheduling
 ----------
-Add a cron entry to run the sync automatically:
-
-  # /etc/cron.d/netbox-meraki-sync
-  0 */4 * * * netbox /opt/netbox/venv/bin/python /opt/netbox/netbox/manage.py \\
-      sync_meraki >> /var/log/netbox/meraki_sync.log 2>&1
+Use the "Run sync" page in NetBox (Meraki Sync > Run Sync) to run or schedule
+the sync from the web UI.
 """
 
 from __future__ import annotations
 
-import logging
-import os
 import sys
-from datetime import datetime, timezone
 
 from django.core.management.base import BaseCommand
 
-from ...choices import SyncStatusChoices
+from ...change_logging import DEFAULT_USERNAME
 from ...collector import MerakiCollector
-from ...models import SyncLog
-from ...signals import _ensure_site_custom_fields
-from ...syncer import MerakiSyncer, get_mapped_sites, update_site_meraki_name
-from ...change_logging import change_logging, DEFAULT_USERNAME
-
-logger = logging.getLogger(__name__)
-
-
-def _plugin_setting(key: str, default=None):
-    try:
-        from netbox.plugins import get_plugin_config
-        return get_plugin_config("netbox_meraki_sync", key) or default
-    except Exception:
-        return default
+from ...sync_runner import (
+    Reporter,
+    SyncRunError,
+    build_collector,
+    run_backfill_device_types,
+    run_sync,
+)
 
 
-def _get_api_key() -> str:
-    key = (
-        _plugin_setting("meraki_api_key", "")
-        or os.environ.get("MERAKI_DASHBOARD_API_KEY", "")
-    )
-    return key
+class _CommandReporter(Reporter):
+    """Send run progress to the command's stdout/stderr."""
+
+    def __init__(self, command):
+        self.cmd = command
+
+    def info(self, message):
+        self.cmd.stdout.write(message)
+
+    def success(self, message):
+        self.cmd.stdout.write(self.cmd.style.SUCCESS(message))
+
+    def warning(self, message):
+        self.cmd.stdout.write(self.cmd.style.WARNING(message))
+
+    def error(self, message):
+        self.cmd.stderr.write(self.cmd.style.ERROR(message))
 
 
 class Command(BaseCommand):
@@ -128,253 +126,27 @@ class Command(BaseCommand):
             ),
         )
 
-    def _handle_backfill_device_types(self):
-        from ...syncer import MerakiSyncer
-        from ...models.sync_log import SyncLog
-
-        if not _plugin_setting("enable_devicetype_library", False):
-            self.stderr.write(self.style.ERROR(
-                "enable_devicetype_library is not set in PLUGINS_CONFIG. "
-                "Enable it before running --backfill-device-types."
-            ))
-            sys.exit(1)
-
-        syncer = MerakiSyncer(
-            sync_log=SyncLog(),
-            enable_devicetype_library=True,
-            devicetype_library_cache_days=_plugin_setting(
-                "devicetype_library_cache_days", 7,
-            ),
-        )
-        self.stdout.write("Checking existing Meraki device types against the Device Type Library...")
-        enriched, skipped = syncer.backfill_device_types()
-        self.stdout.write(self.style.SUCCESS(
-            f"Done — {enriched} device type(s) enriched, {skipped} already had data or no match found."
-        ))
-
     def handle(self, *args, **options):
-        if options["backfill_device_types"]:
-            self._handle_backfill_device_types()
-            return
+        try:
+            if options["backfill_device_types"]:
+                run_backfill_device_types(_CommandReporter(self))
+                return
 
-        api_key = _get_api_key()
-        if not api_key:
-            self.stderr.write(self.style.ERROR(
-                "No Meraki API key configured.\n"
-                "Set meraki_api_key in PLUGINS_CONFIG or the "
-                "MERAKI_DASHBOARD_API_KEY environment variable."
-            ))
+            if options["list_networks"]:
+                self._list_networks(build_collector())
+                return
+
+            totals = run_sync(
+                _CommandReporter(self),
+                network_filter=options["network"],
+                dry_run=options["dry_run"],
+                username=options.get("user"),
+            )
+        except SyncRunError as exc:
+            self.stderr.write(self.style.ERROR(str(exc)))
             sys.exit(1)
-
-        dry_run         = options["dry_run"]
-        # IP addresses and VLANs/prefixes are synced on every run by default.
-        # --sync-ips / --sync-vlans (or the matching plugin settings) are kept
-        # only in case someone wants to force them on explicitly; they can no
-        # longer be used to turn this off.
-        sync_ips        = True
-        sync_vlans      = True
-        network_filter  = options["network"]
-        list_networks   = options["list_networks"]
-        proxy           = _plugin_setting("http_proxy", "") or ""
-        timeout         = _plugin_setting("request_timeout", 30) or 30
-        role_slug       = _plugin_setting("default_device_role", "network") or "network"
-
-        if dry_run:
-            self.stdout.write(self.style.WARNING("DRY RUN — no database writes"))
-
-        collector = MerakiCollector(api_key=api_key, timeout=timeout, proxy=proxy)
-
-        # ------------------------------------------------------------------
-        # --list-networks mode
-        # ------------------------------------------------------------------
-        if list_networks:
-            self._list_networks(collector)
-            return
-
-        # ------------------------------------------------------------------
-        # Ensure custom fields exist before any ORM reads
-        # ------------------------------------------------------------------
-        _ensure_site_custom_fields()
-
-        # ------------------------------------------------------------------
-        # Build the list of (site, network_id) pairs to sync
-        # ------------------------------------------------------------------
-        mapped_sites = get_mapped_sites()
-        if not mapped_sites:
-            self.stdout.write(self.style.WARNING(
-                "No NetBox sites have meraki_network_id set.\n"
-                "Populate the custom field on a Site to map it to a Meraki network.\n"
-                "Use --list-networks to see available network IDs."
-            ))
-            return
-
-        if network_filter:
-            mapped_sites = [
-                s for s in mapped_sites
-                if s.custom_field_data.get("meraki_network_id") == network_filter
-            ]
-            if not mapped_sites:
-                self.stderr.write(self.style.ERROR(
-                    f"No NetBox site has meraki_network_id = {network_filter!r}"
-                ))
-                sys.exit(1)
-
-        self.stdout.write(
-            f"Syncing {len(mapped_sites)} Meraki network(s) into NetBox…"
-        )
-
-        # ------------------------------------------------------------------
-        # Sync each network
-        # ------------------------------------------------------------------
-        total_devices   = 0
-        total_created   = 0
-        total_updated   = 0
-        total_interfaces = 0
-        total_ips       = 0
-        total_vlans     = 0
-        total_prefixes  = 0
-        total_static_routes = 0
-        total_wireless_lans = 0
-        failed_networks = 0
-
-        changelog_user = (
-            options.get("user")
-            or _plugin_setting("changelog_username", DEFAULT_USERNAME)
-            or DEFAULT_USERNAME
-        )
-        # All writes below run inside NetBox's change-tracking context so
-        # they appear in the changelog (one request ID per sync run).
-        with change_logging(changelog_user, enabled=not dry_run):
-            for site in mapped_sites:
-                network_id = site.custom_field_data["meraki_network_id"]
-                site_name  = site.name
-
-                self.stdout.write(f"\n[{network_id}] → site: {site_name}")
-
-                # Create a SyncLog entry for this network
-                sync_log = SyncLog(
-                    network_id   = network_id,
-                    site_name    = site_name,
-                    status       = SyncStatusChoices.RUNNING,
-                )
-                if not dry_run:
-                    sync_log.save()
-
-                syncer = MerakiSyncer(
-                    sync_log          = sync_log,
-                    dry_run           = dry_run,
-                    sync_ips          = sync_ips,
-                    default_role_slug = role_slug,
-                    enable_devicetype_library = _plugin_setting(
-                        "enable_devicetype_library", False,
-                    ),
-                    devicetype_library_cache_days = _plugin_setting(
-                        "devicetype_library_cache_days", 7,
-                    ),
-                )
-
-                try:
-                    devices = collector.collect_network(network_id)
-
-                    # Back-fill the Meraki network name onto the site
-                    # (we don't get the name from getNetworkDevices, so we store
-                    # whatever the user populated — or leave it to be set manually)
-
-                    self.stdout.write(
-                        f"  Collected {len(devices)} device(s) from Meraki"
-                    )
-
-                    syncer.sync_devices(devices, site=site)
-
-                    if sync_vlans:
-                        # Try every device, not just ones with an "MS" model
-                        # prefix — some Layer 3 switches (e.g. Catalyst switches
-                        # onboarded for Meraki cloud monitoring) report other
-                        # model strings, and getDeviceSwitchRoutingInterfaces
-                        # safely 404s/returns empty for anything that isn't a
-                        # switch, so there's no harm in trying every serial.
-                        switch_serials = [d.serial for d in devices]
-                        ipam_data = collector.collect_network_ipam(
-                            network_id, site_name=site.name, switch_serials=switch_serials,
-                        )
-                        self.stdout.write(
-                            f"  Collected {len(ipam_data.vlans)} VLAN/subnet "
-                            f"record(s) and {len(ipam_data.static_routes)} "
-                            f"static route(s) from Meraki"
-                        )
-                        ipam_errors = syncer.sync_ipam(ipam_data, site=site)
-                        for err in ipam_errors:
-                            self.stderr.write(self.style.ERROR(f"  IPAM error: {err}"))
-
-                    ssids = collector.collect_network_wireless(network_id)
-                    if ssids:
-                        self.stdout.write(f"  Collected {len(ssids)} enabled SSID(s) from Meraki")
-                        wireless_errors = syncer.sync_wireless(ssids, site=site)
-                        for err in wireless_errors:
-                            self.stderr.write(self.style.ERROR(f"  Wireless error: {err}"))
-
-                    syncer.close(success=True)
-
-                    total_devices    += sync_log.devices_seen
-                    total_created    += sync_log.devices_created
-                    total_updated    += sync_log.devices_updated
-                    total_interfaces += sync_log.interfaces_synced
-                    total_ips        += sync_log.ips_synced
-                    total_vlans      += sync_log.vlans_synced
-                    total_prefixes   += sync_log.prefixes_synced
-                    total_static_routes += sync_log.static_routes_synced
-                    total_wireless_lans += sync_log.wireless_lans_synced
-
-                    self.stdout.write(self.style.SUCCESS(
-                        f"  Done — "
-                        f"{sync_log.devices_created} created, "
-                        f"{sync_log.devices_updated} updated, "
-                        f"{sync_log.interfaces_synced} interfaces"
-                        + (f", {sync_log.ips_synced} IPs" if sync_ips else "")
-                        + (
-                            f", {sync_log.vlans_synced} VLANs, "
-                            f"{sync_log.prefixes_synced} prefixes, "
-                            f"{sync_log.static_routes_synced} static routes"
-                            if sync_vlans else ""
-                        )
-                        + (
-                            f", {sync_log.wireless_lans_synced} SSIDs"
-                            if sync_log.wireless_lans_synced else ""
-                        )
-                    ))
-
-                except Exception as exc:
-                    msg = f"Sync failed for network {network_id}: {exc}"
-                    logger.exception(msg)
-                    syncer.close(success=False, message=str(exc))
-                    self.stderr.write(self.style.ERROR(f"  ERROR: {exc}"))
-                    failed_networks += 1
-
-        # ------------------------------------------------------------------
-        # Summary
-        # ------------------------------------------------------------------
-        self.stdout.write("")
-        if dry_run:
-            self.stdout.write(self.style.WARNING(
-                f"Dry-run complete. Would have synced {total_devices} device(s) "
-                f"across {len(mapped_sites)} network(s)."
-            ))
-        else:
-            self.stdout.write(self.style.SUCCESS(
-                f"Sync complete — "
-                f"{total_devices} devices seen, "
-                f"{total_created} created, "
-                f"{total_updated} updated, "
-                f"{total_interfaces} interfaces"
-                + (f", {total_ips} IPs" if sync_ips else "")
-                + (
-                    f", {total_vlans} VLANs, {total_prefixes} prefixes, "
-                    f"{total_static_routes} static routes"
-                    if sync_vlans else ""
-                )
-                + (f", {total_wireless_lans} SSIDs" if total_wireless_lans else "")
-                + (f"  [{failed_networks} network(s) failed]" if failed_networks else "")
-            ))
+        if totals.failed_networks:
+            sys.exit(2)
 
     # ------------------------------------------------------------------
     # List networks helper

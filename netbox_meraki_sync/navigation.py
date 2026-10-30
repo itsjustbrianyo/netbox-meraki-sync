@@ -7,6 +7,11 @@ menu = PluginMenu(
             "Meraki",
             (
                 PluginMenuItem(
+                    link="plugins:netbox_meraki_sync:run_sync",
+                    link_text="Run Sync",
+                    permissions=["netbox_meraki_sync.add_synclog"],
+                ),
+                PluginMenuItem(
                     link="plugins:netbox_meraki_sync:synclog_list",
                     link_text="Sync Logs",
                     buttons=(

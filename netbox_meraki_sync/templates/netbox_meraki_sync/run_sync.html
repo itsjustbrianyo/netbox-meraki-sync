@@ -1,0 +1,79 @@
+{% extends 'base/layout.html' %}
+{% load helpers %}
+
+{% block title %}Run Meraki Sync{% endblock %}
+
+{% block content %}
+<div class="row">
+  <div class="col col-md-6">
+    <form method="post">
+      {% csrf_token %}
+      <div class="card">
+        <h5 class="card-header">Run or schedule a sync</h5>
+        <div class="card-body">
+          {{ form.non_field_errors }}
+          {% for field in form %}
+            <div class="mb-3">
+              <label class="form-label" for="{{ field.id_for_label }}">{{ field.label }}</label>
+              {% if field.field.widget.input_type == 'checkbox' %}
+                <div>{{ field }}</div>
+              {% else %}
+                <div class="form-control-wrapper">{{ field }}</div>
+              {% endif %}
+              {% if field.help_text %}<div class="form-text">{{ field.help_text }}</div>{% endif %}
+              {% for err in field.errors %}<div class="text-danger">{{ err }}</div>{% endfor %}
+            </div>
+          {% endfor %}
+        </div>
+        <div class="card-footer text-end">
+          <button type="submit" class="btn btn-primary">
+            <i class="mdi mdi-play"></i> Run / Schedule
+          </button>
+        </div>
+      </div>
+    </form>
+  </div>
+
+  <div class="col col-md-6">
+    <div class="card mb-3">
+      <h5 class="card-header">Scheduled syncs</h5>
+      <table class="table table-hover mb-0">
+        <thead><tr><th>Job</th><th>Next run</th><th>Every (min)</th><th>By</th></tr></thead>
+        <tbody>
+        {% for job in scheduled_jobs %}
+          <tr>
+            <td><a href="{{ job.get_absolute_url }}">#{{ job.pk }}</a></td>
+            <td>{{ job.scheduled|default:"—" }}</td>
+            <td>{{ job.interval|default:"—" }}</td>
+            <td>{{ job.user|default:"—" }}</td>
+          </tr>
+        {% empty %}
+          <tr><td colspan="4" class="text-muted">None.</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      <div class="card-footer text-muted small">
+        To cancel a schedule, open the job and delete it.
+      </div>
+    </div>
+
+    <div class="card">
+      <h5 class="card-header">Recent runs</h5>
+      <table class="table table-hover mb-0">
+        <thead><tr><th>Job</th><th>Status</th><th>Created</th></tr></thead>
+        <tbody>
+        {% for job in recent_jobs %}
+          <tr>
+            <td><a href="{{ job.get_absolute_url }}">#{{ job.pk }}</a></td>
+            <td><span class="badge bg-{{ job.get_status_color }}">{{ job.get_status_display }}</span></td>
+            <td>{{ job.created }}</td>
+          </tr>
+        {% empty %}
+          <tr><td colspan="3" class="text-muted">No runs yet.</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+{% endblock %}
